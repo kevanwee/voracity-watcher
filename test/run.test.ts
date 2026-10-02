@@ -186,6 +186,21 @@ describe('a watcher run', () => {
     expect((await run(env, memory.store, { runner: 'local', test: true })).sent[0]).toBe('Doot Doot.\nIca is connected to Voracity from your PC. 2 sites are being watched.');
   });
 
+  it('adopts watches the cloud runner refused before hand-offs existed, without another cloud request', async () => {
+    const memory = memoryStore([watch()]);
+    memory.states.set('w1', { status: 'error', checkedAt: 0, error: 'the site refused access (HTTP 403)', failures: 1, retryAt: 1 });
+    const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': ok(html('a')) });
+    await run(env, memory.store);
+    expect(env.requests).toEqual([]); // the cloud leaves it alone
+    const local = await run(env, memory.store, { runner: 'local' });
+    expect(local.sent[0]).toContain('Now watching');
+    expect(memory.states.get('w1')).toMatchObject({ status: 'ok', route: 'local' });
+    env.advance(5 * 60_000);
+    env.requests.length = 0;
+    await run(env, memory.store);
+    expect(env.requests).toEqual([]); // still the PC's, even after a successful check
+  });
+
   it("watches set to 'Only my PC' are never fetched by the cloud runner", async () => {
     const memory = memoryStore([watch({ runOn: 'local' })]);
     const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': ok(html('a')) });

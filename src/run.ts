@@ -62,7 +62,15 @@ export const MANUAL_COOLDOWN_MS = 60_000;
 export type OutcomeKind = 'changed' | 'unchanged' | 'baseline' | 'failed' | 'moved' | 'waiting';
 export interface Outcome { label: string; kind: OutcomeKind; detail: string }
 
-export const routeOf = (state: WatchState | undefined, watch?: Watch): Runner => (watch?.runOn === 'local' ? 'local' : state?.route ?? 'cloud');
+/**
+ * A 401/403 refusal recorded by the cloud runner before hand-offs existed (no
+ * cloudRefusals field). Treated as already handed over, so the cloud never asks again.
+ */
+export const legacyCloudRefusal = (state?: WatchState) =>
+  !!state && !state.route && state.cloudRefusals === undefined && state.status === 'error' && /^the site refused access \(HTTP 40[13]\)/.test(state.error ?? '');
+
+export const routeOf = (state: WatchState | undefined, watch?: Watch): Runner =>
+  watch?.runOn === 'local' || legacyCloudRefusal(state) ? 'local' : state?.route ?? 'cloud';
 
 /**
  * Watches this runner should check now. Each runner only checks watches routed to it,
@@ -156,7 +164,13 @@ export async function runOnce(deps: Deps) {
       if (now() - started > budget) { totals.postponed++; record(watch, 'waiting', 'postponed to the next run'); continue; }
       let url: URL, host: string;
       try { url = new URL(watch.url); host = hostOf(watch.url); } catch { continue; }
-      const previousState = states.get(watch.id), previous = itemDocs.get(watch.id);
+      let previousState = states.get(watch.id);
+      const previous = itemDocs.get(watch.id);
+      if (runner === 'local' && legacyCloudRefusal(previousState)) {
+        // Record the hand-off so it survives this watch's next successful check.
+        previousState = { ...previousState!, route: 'local', movedAt: now() };
+        await deps.store.save(uid, watch.id, previousState);
+      }
       const sameSettings = previous && previous.url === watch.url && previous.selector === watch.selector && previous.ignore === watch.ignore;
       const policy = await policyFor(url);
       const { spacing, perRun } = hostLimits(policy);
