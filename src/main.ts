@@ -7,7 +7,7 @@ import { sendTelegram } from './telegram.ts';
 class SetupError extends Error {}
 
 /** Secrets pasted through Windows PowerShell 5.1 can arrive with a byte-order mark or a trailing newline. */
-const secret = (name: string) => process.env[name]?.replace(/^﻿/, '').trim() || undefined;
+const secret = (name: string) => process.env[name]?.replace(/^\uFEFF/, '').trim() || undefined;
 
 function owners(): Record<string, string> {
   let parsed: unknown;
