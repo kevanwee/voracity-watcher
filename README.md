@@ -96,8 +96,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\local\install.ps1 `
 powershell -ExecutionPolicy Bypass -File .\scripts\local\run.ps1 -Test   # Ica: "connected from your PC"
 ```
 
-This registers a **Voracity watcher** task that runs every 5 minutes while you
-are signed in, without a window.
+This registers a **Voracity watcher** task. It starts a small listener when you
+sign in, with no window, and relaunches it if it ever stops. The listener checks
+your PC's watches every 5 minutes and answers Telegram commands.
 
 - **Secrets:** stored in `%USERPROFILE%\.voracity-watcher\`, encrypted with
   Windows DPAPI (readable only by your Windows account), so you can delete the
@@ -105,6 +106,29 @@ are signed in, without a window.
 - **Log:** `logs\watcher.log` in the same folder, counts only.
 - **Changing the token:** `install.ps1 -UpdateToken`.
 - **Removing everything:** `install.ps1 -Uninstall`.
+
+## Asking Ica to check
+
+Message Ica on Telegram. These commands also appear in the bot's `/` menu:
+
+| Command | What happens |
+| --- | --- |
+| `/check` | Checks every watch on your PC now. Changes arrive as normal alerts, followed by a summary per watch |
+| `/check ex13` | Checks only watches whose name contains "ex13" |
+| `/status` | Lists each watch, whether GitHub or your PC checks it, and its last check and change |
+| `/help` | Lists the commands |
+
+How commands are handled:
+
+- **Owner only.** Ica answers only chats listed in `WATCHER_OWNERS` and ignores everyone else.
+- **Same site rules.** A requested check still obeys robots.txt, Crawl-delay and any
+  Retry-After or backoff. Each watch can be checked on request at most once a minute.
+- **No overlap.** Scheduled and requested checks share one queue in one process, so they
+  never overlap or double-alert.
+- **PC watches only.** `/check` covers watches on your PC. GitHub watches keep their own
+  schedule, and `/status` shows their last check.
+- **Nothing runs late.** Commands sent while your PC was off aren't run when it comes
+  back; Ica asks you to resend.
 
 ## What is compared
 
