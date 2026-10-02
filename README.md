@@ -141,7 +141,7 @@ handled (Mozilla's `ical.js`). Ica can read the calendar but can't add events to
 
 ## Quick capture
 
-Message Ica and she proposes a card with **Save** and **Cancel** buttons. Nothing is
+Message Ica and it proposes a card with **Save** and **Cancel** buttons. Nothing is
 saved until you tap Save.
 
 | Message | Becomes |
