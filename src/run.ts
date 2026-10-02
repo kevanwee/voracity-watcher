@@ -73,13 +73,25 @@ export const routeOf = (state: WatchState | undefined, watch?: Watch): Runner =>
   watch?.runOn === 'local' || legacyCloudRefusal(state) ? 'local' : state?.route ?? 'cloud';
 
 /**
+ * Moved to the PC but not yet checked from it. The cloud's refusal and backoff don't
+ * apply to the PC's connection, so the first local check happens on the next run
+ * instead of after the watch's interval.
+ */
+export const awaitingLocalCheck = (state?: WatchState) =>
+  !!state && (legacyCloudRefusal(state) || (state.route === 'local' && state.movedAt !== undefined && state.movedAt >= state.checkedAt));
+
+/**
  * Watches this runner should check now. Each runner only checks watches routed to it,
  * so a watch is never fetched by both. A moved watch is never retried from the cloud,
  * because repeatedly requesting a site that refuses data-centre IPs risks a wider ban.
  */
 export function selectDue(watches: Watch[], states: Map<string, WatchState>, runner: Runner, now: number) {
   return watches.slice(0, MAX_PER_OWNER)
-    .filter(watch => routeOf(states.get(watch.id), watch) === runner && isDue(watch, states.get(watch.id), now))
+    .filter(watch => {
+      const state = states.get(watch.id);
+      if (routeOf(state, watch) !== runner) return false;
+      return (runner === 'local' && watch.enabled && awaitingLocalCheck(state)) || isDue(watch, state, now);
+    })
     .sort((a, b) => (states.get(a.id)?.checkedAt ?? 0) - (states.get(b.id)?.checkedAt ?? 0));
 }
 
@@ -89,7 +101,7 @@ export function selectManual(watches: Watch[], states: Map<string, WatchState>, 
   for (const watch of watches.slice(0, MAX_PER_OWNER)) {
     const state = states.get(watch.id);
     if (!watch.enabled || !match(watch) || routeOf(state, watch) !== runner) continue;
-    if (state?.retryAt && now < state.retryAt) waiting.push({ label: watch.label, kind: 'waiting', detail: `backing off until ${clock(state.retryAt)} (${state.error ?? 'earlier failure'})` });
+    if (state?.retryAt && now < state.retryAt && !(runner === 'local' && awaitingLocalCheck(state))) waiting.push({ label: watch.label, kind: 'waiting', detail: `backing off until ${clock(state.retryAt)} (${state.error ?? 'earlier failure'})` });
     else if (state && now - state.checkedAt < MANUAL_COOLDOWN_MS) waiting.push({ label: watch.label, kind: 'waiting', detail: 'checked less than a minute ago' });
     else due.push(watch);
   }
@@ -168,7 +180,7 @@ export async function runOnce(deps: Deps) {
       const previous = itemDocs.get(watch.id);
       if (runner === 'local' && legacyCloudRefusal(previousState)) {
         // Record the hand-off so it survives this watch's next successful check.
-        previousState = { ...previousState!, route: 'local', movedAt: now() };
+        previousState = { ...previousState!, route: 'local', movedAt: now(), retryAt: undefined, failures: 0, alerted: false };
         await deps.store.save(uid, watch.id, previousState);
       }
       const sameSettings = previous && previous.url === watch.url && previous.selector === watch.selector && previous.ignore === watch.ignore;

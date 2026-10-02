@@ -154,6 +154,10 @@ describe('a watcher run', () => {
     }
     expect(page()).toBe(2);
     expect(memory.heartbeats.every(runner => runner === 'cloud')).toBe(true);
+    // The PC checks it on its very next run, without waiting out the interval.
+    const local = await run(env, memory.store, { runner: 'local' });
+    expect(local.logs.at(-1)).toContain('checked 1');
+    expect(page()).toBe(3);
   });
 
   it('the local runner checks only moved watches, alerts on its own refusals and announces recovery once', async () => {
@@ -188,7 +192,8 @@ describe('a watcher run', () => {
 
   it('adopts watches the cloud runner refused before hand-offs existed, without another cloud request', async () => {
     const memory = memoryStore([watch()]);
-    memory.states.set('w1', { status: 'error', checkedAt: 0, error: 'the site refused access (HTTP 403)', failures: 1, retryAt: 1 });
+    // As left by the old cloud runner: an hour-long backoff from a daily-ish interval.
+    memory.states.set('w1', { status: 'error', checkedAt: 999_999_000_000, error: 'the site refused access (HTTP 403)', failures: 1, retryAt: 1_000_000_000_000 + 3_600_000 });
     const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': ok(html('a')) });
     await run(env, memory.store);
     expect(env.requests).toEqual([]); // the cloud leaves it alone
