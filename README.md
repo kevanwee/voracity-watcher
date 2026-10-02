@@ -26,10 +26,12 @@ unlimited Actions minutes, and no addresses or personal data are published.
 flowchart LR
     owner(["👤 Owner"]) -->|adds watches| voracity["Voracity<br/>Site watcher panel"]
     voracity -->|"users/{uid}/watches"| fs[("Cloud Firestore")]
-    cron["GitHub Actions<br/>every 5 min"] --> runner["voracity-watcher<br/>(this repo)"]
-    runner -->|"read watches,<br/>write watchState"| fs
+    cron["GitHub Actions<br/>every 5 min"] --> runner["Cloud runner<br/>(this repo)"]
+    task["Task Scheduler<br/>every 5 min"] --> local["Local runner<br/>(same code, your PC)"]
+    runner & local -->|"read watches,<br/>write watchState"| fs
     runner -->|"robots.txt, then page<br/>(identified, spaced)"| sites["Watched sites"]
-    runner -->|"Doot Doot. …"| tg["Telegram Bot API"] --> owner
+    local -->|"only watches the cloud<br/>was refused by"| sites
+    runner & local -->|"Doot Doot. …"| tg["Telegram Bot API"] --> owner
     fs -->|status, last change| voracity
 ```
 
@@ -61,6 +63,48 @@ The runner is built so sites have no reason to block it:
 Check each site's terms yourself as well. robots.txt says what automated access a site
 allows; its terms may add more. Alerts are for your own use: don't republish content
 you're notified about.
+
+## Cloud first, then your PC
+
+Some sites refuse every request from data-centre IP ranges, including GitHub
+Actions, while accepting the same request from a home connection. Each watch
+therefore has a route:
+
+- **Automatic (default):** the cloud runner checks the watch. If the site
+  answers `401`/`403` twice in a row, the watch moves to your PC **for good**,
+  and Ica tells you. The cloud runner never contacts that site again: retrying
+  a site that is refusing you is how IP bans start.
+- **Only my PC:** chosen in Voracity for sites you already know block cloud
+  servers. The cloud runner never requests it at all.
+
+Each runner checks only the watches routed to it, so a page is never fetched
+twice and alerts never duplicate. The local runner obeys exactly the same rules
+(robots.txt, Crawl-delay, backoff). Refusals it sees are reported normally. It
+only runs while your PC is on and awake. Voracity shows each runner's last
+check-in and warns if your PC hasn't checked in.
+
+### Install the local runner (Windows)
+
+Use Node 24. From a clone of this repository:
+
+```powershell
+npm ci
+powershell -ExecutionPolicy Bypass -File .\scripts\local\install.ps1 `
+  -ServiceAccountPath "$HOME\Downloads\<key>.json" `
+  -Owners '{"<notes UID>":"<Telegram chat ID>"}'
+# prompts for the Telegram bot token
+powershell -ExecutionPolicy Bypass -File .\scripts\local\run.ps1 -Test   # Ica: "connected from your PC"
+```
+
+This registers a **Voracity watcher** task that runs every 5 minutes while you
+are signed in, without a window.
+
+- **Secrets:** stored in `%USERPROFILE%\.voracity-watcher\`, encrypted with
+  Windows DPAPI (readable only by your Windows account), so you can delete the
+  downloaded key afterwards.
+- **Log:** `logs\watcher.log` in the same folder, counts only.
+- **Changing the token:** `install.ps1 -UpdateToken`.
+- **Removing everything:** `install.ps1 -Uninstall`.
 
 ## What is compared
 
@@ -123,7 +167,7 @@ these paths for each owner listed in `WATCHER_OWNERS`:
 | `users/{uid}/watches/{id}` | read | Watch configuration written by Voracity |
 | `users/{uid}/watchState/{id}` | write | Status shown in Voracity: last check, item count, last change, error, backoff |
 | `users/{uid}/watchItems/{id}` | read/write | The previous item snapshot used for comparison; not readable by browsers |
-| `users/{uid}/watcher/status` | write | Heartbeat (`lastRunAt`), so Voracity can warn if the schedule stops |
+| `users/{uid}/watcher/status` | write | Heartbeats (`cloudRunAt`, `localRunAt`), so Voracity can warn if a runner stops |
 
 Alerts for an owner go only to that owner's chat. If Telegram is unreachable, the old
 snapshot is kept, so the change is reported on a later run.
@@ -137,6 +181,8 @@ messages are reduced to fixed text or error codes.
 ## Limits
 
 - GitHub runs schedules every 5 minutes at best, and often starts them 5–15 minutes late.
+- Watches on your PC pause while it is off or asleep. Missed checks run when it wakes.
+- A watch that moved to your PC stays there. To try the cloud again, delete it and add it again.
 - GitHub disables schedules in public repositories after 60 days without commits. The
   workflow re-enables itself daily, and Voracity warns you if the runner hasn't checked in
   for 45 minutes.
