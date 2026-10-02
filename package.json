@@ -1,0 +1,31 @@
+{
+  "name": "voracity-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scheduled site watcher for Voracity: checks pages politely and sends changes to Telegram.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "watch": "node src/main.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "firebase-admin": "^14.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "domhandler": "^5.0.3",
+    "typescript": "~5.9.0",
+    "vitest": "^5.0.3"
+  },
+  "overrides": {
+    "gaxios": {
+      "uuid": "^11.1.1"
+    }
+  }
+}
