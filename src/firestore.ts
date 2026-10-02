@@ -2,6 +2,7 @@ import { cert, initializeApp } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import type { AssistantSettings, AssistantStore, Bookmark, Reminder, Schedule } from './assistant.ts';
 import { VERSION } from './fetch.ts';
+import type { CardDoc, WriteResult } from './edit.ts';
 import type { CaptureStore, NewBookmark, NewCard, Pending } from './listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from './run.ts';
 
@@ -88,6 +89,36 @@ export function firestoreStore(serviceAccountJson: string | undefined): FullStor
     },
     async createBookmark(uid, bookmark: NewBookmark) {
       await user(uid).collection('bookmarks').doc(bookmark.id).create(bookmark);
+    },
+    async brainSettings(uid) {
+      const snap = await user(uid).collection('settings').doc('brain').get();
+      return snap.exists ? (snap.data() as { ollamaUrl?: string; ollamaModel?: string }) : null;
+    },
+    async cards(uid) {
+      const snap = await user(uid).collection('cards').get();
+      return snap.docs.map(doc => ({ ...doc.data(), id: doc.id }) as CardDoc);
+    },
+    // Same protection as Voracity's editor: write only if the revision is unchanged, then bump it.
+    async updateCard(uid, id, revision, patch, now): Promise<WriteResult> {
+      const ref = user(uid).collection('cards').doc(id);
+      return db.runTransaction(async tx => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return 'missing';
+        const card = snap.data() as CardDoc;
+        if (card.revision !== revision) return 'conflict';
+        tx.update(ref, { ...patch, updatedAt: now, revision: revision + 1 });
+        return 'ok';
+      });
+    },
+    async deleteCard(uid, id, revision): Promise<WriteResult> {
+      const ref = user(uid).collection('cards').doc(id);
+      return db.runTransaction(async tx => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return 'missing';
+        if ((snap.data() as CardDoc).revision !== revision) return 'conflict';
+        tx.delete(ref);
+        return 'ok';
+      });
     },
   };
 }

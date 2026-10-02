@@ -8,7 +8,7 @@ import type { Store } from './run.ts';
 export interface AssistantSettings { briefing: boolean; reminderAlerts: boolean; dayBefore: boolean; morning: string; timezone: string }
 export const DEFAULT_SETTINGS: AssistantSettings = { briefing: true, reminderAlerts: true, dayBefore: true, morning: '08:00', timezone: 'Asia/Singapore' };
 
-export interface Reminder { id: string; title: string; dueDate: string }
+export interface Reminder { id: string; title: string; dueDate: string; revision?: number }
 export interface Bookmark { id: string; title: string; url: string; createdAt: number }
 /** Runner-only bookkeeping at users/{uid}/assistant/schedule. */
 export interface Schedule { morningFor?: string; briefedAt?: number; alerted?: Record<string, string> }
@@ -43,10 +43,22 @@ const ago = (ms: number, now: number) => { const h = Math.round((now - ms) / 3_6
 export interface BriefingInput {
   today: string; dueToday: Reminder[]; overdue: Reminder[]; tomorrow: Reminder[];
   changes: { label: string; summary: string; at: number }[]; unread: Bookmark[]; now: number;
+  /** Today's calendar, already formatted ("09:00–10:30 Lecture (LT1)"). */
+  events?: string[];
+}
+
+/** One "✓" button per reminder (at most five), each a single-tap, revision-checked "done". */
+export function doneButtons(reminders: Reminder[]): Buttons | undefined {
+  const rows = reminders.filter(r => r.revision !== undefined).slice(0, 5).map(r => {
+    const data = `done:${r.id}:${r.revision}`;
+    return data.length <= 64 ? [{ text: `✓ ${r.title.length > 30 ? r.title.slice(0, 29) + '…' : r.title}`, data }] : null;
+  }).filter((row): row is { text: string; data: string }[] => !!row);
+  return rows.length ? rows : undefined;
 }
 
 export function briefingMessage(b: BriefingInput) {
   const lines = [GREETING, `Good morning! Here's ${longDate(b.today)}.`];
+  if (b.events?.length) lines.push('', '<b>Calendar</b>', ...bullets(b.events.map(escapeHtml)));
   if (b.dueToday.length) lines.push('', '<b>Due today</b>', ...bullets(b.dueToday.map(r => escapeHtml(r.title))));
   else lines.push('', 'Nothing due today.');
   if (b.overdue.length) lines.push('', '<b>Still open</b>', ...bullets(b.overdue.map(r => `${escapeHtml(r.title)} (was due ${formatDue(r.dueDate, b.today)})`)));
@@ -68,10 +80,13 @@ export function addedTodayMessage(reminders: Reminder[]) {
   return [GREETING, reminders.length === 1 ? 'Due today:' : 'Due today, added since this morning:', ...bullets(reminders.map(r => `<b>${escapeHtml(r.title)}</b>`))].join('\n');
 }
 
+export type Buttons = { text: string; data: string }[][];
 export interface AssistantDeps {
   owners: Record<string, string>;
   store: Store & AssistantStore;
-  send: (chatId: string, text: string) => Promise<void>;
+  send: (chatId: string, text: string, buttons?: Buttons) => Promise<void>;
+  /** Today's events from the owner's private calendar feeds, if any are connected. */
+  events?: (uid: string, today: string, timeZone: string) => Promise<string[]>;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -91,7 +106,7 @@ export async function runAssistant(deps: AssistantDeps) {
     if (time < settings.morning) continue;
     const schedule = await deps.store.schedule(uid);
     const alerted = Object.fromEntries(Object.entries(schedule.alerted ?? {}).filter(([, day]) => day === today));
-    const send = async (text: string) => { try { await deps.send(chatId, text); return true; } catch { totals.failures++; return false; } };
+    const send = async (text: string, buttons?: Buttons) => { try { await deps.send(chatId, text, buttons); return true; } catch { totals.failures++; return false; } };
 
     if (schedule.morningFor !== today) {
       const open = await deps.store.openReminders(uid);
@@ -106,10 +121,11 @@ export async function runAssistant(deps: AssistantDeps) {
           const state = states.get(watch.id);
           return state?.changedAt && state.changedAt > since && state.summary ? [{ label: watch.label, summary: state.summary, at: state.changedAt }] : [];
         });
-        sent = await send(briefingMessage({ today, dueToday, overdue, tomorrow, changes, unread: unread.sort((a, b) => b.createdAt - a.createdAt), now: now() }));
+        const events = deps.events ? await deps.events(uid, today, settings.timezone).catch(() => []) : [];
+        sent = await send(briefingMessage({ today, dueToday, overdue, tomorrow, changes, unread: unread.sort((a, b) => b.createdAt - a.createdAt), now: now(), events }), doneButtons([...dueToday, ...overdue]));
         if (sent) totals.briefings++;
       } else if (dueToday.length || overdue.length || tomorrow.length) {
-        sent = await send(morningReminderMessage(today, dueToday, overdue, tomorrow));
+        sent = await send(morningReminderMessage(today, dueToday, overdue, tomorrow), doneButtons([...dueToday, ...overdue]));
         if (sent) totals.alerts++;
       }
       // If Telegram is down, try the morning message again next run.
@@ -123,7 +139,7 @@ export async function runAssistant(deps: AssistantDeps) {
     if (!settings.reminderAlerts) continue;
     const fresh = (await deps.store.openReminders(uid, today)).filter(r => alerted[r.id] !== today);
     if (!fresh.length) continue;
-    if (await send(addedTodayMessage(fresh))) {
+    if (await send(addedTodayMessage(fresh), doneButtons(fresh))) {
       totals.alerts++;
       for (const r of fresh) alerted[r.id] = today;
       await deps.store.saveSchedule(uid, { ...schedule, alerted });

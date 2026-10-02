@@ -68,6 +68,21 @@ describe('morning briefing', () => {
     expect(s.sent[1]).toContain("Here's Saturday 3 October.");
   });
 
+  it("adds today's calendar and one-tap done buttons for what is due", async () => {
+    let schedule = {};
+    const sent: { text: string; buttons?: unknown }[] = [];
+    const store: any = {
+      watches: async () => [], states: async () => new Map(), items: async () => new Map(), save: async () => {}, removeItems: async () => {}, heartbeat: async () => {},
+      settings: async () => null, schedule: async () => schedule, saveSchedule: async (_u: string, s: any) => { schedule = s; },
+      openReminders: async () => [{ id: '0f8fad5b-d9cb-469f-a165-70867728950e', title: 'File the brief', dueDate: '2026-10-02', revision: 4 }],
+      unreadBookmarks: async () => [],
+    };
+    await runAssistant({ owners: { [UID]: CHAT }, store, now: () => at('08:00'), send: async (_c, text, buttons) => { sent.push({ text, buttons }); },
+      events: async (_uid, today, tz) => (today === '2026-10-02' && tz === 'Asia/Singapore' ? ['09:00–10:30 Lecture (LT1)', 'All day Moot'] : []) });
+    expect(sent[0].text).toContain('<b>Calendar</b>\n• 09:00–10:30 Lecture (LT1)\n• All day Moot\n\n<b>Due today</b>');
+    expect(sent[0].buttons).toEqual([[{ text: '✓ File the brief', data: 'done:0f8fad5b-d9cb-469f-a165-70867728950e:4' }]]);
+  });
+
   it('says when nothing is due, and arrives late rather than never', async () => {
     const s = setup([]);
     s.set(at('14:30'));
