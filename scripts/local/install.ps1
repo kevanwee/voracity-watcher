@@ -5,6 +5,8 @@
 #   .\scripts\local\install.ps1 -ServiceAccountPath <key.json> -Owners '{"<uid>":"<chat id>"}'
 #     Prompts for the Telegram bot token (or pass -TelegramToken).
 #   .\scripts\local\install.ps1 -UpdateToken      Replace only the Telegram token.
+#   .\scripts\local\install.ps1 -Calendars '{"<uid>":["<secret iCal address>"]}'
+#     Add or replace only the private calendar feeds (Ica's briefing and questions).
 #   .\scripts\local\install.ps1 -Uninstall        Remove the task and stored secrets.
 #
 # Secrets are encrypted with Windows DPAPI, so only this Windows account on this
@@ -14,6 +16,7 @@ param(
   [string]$Owners,
   [string]$TelegramToken,
   [switch]$UpdateToken,
+  [string]$Calendars,
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -37,6 +40,14 @@ function Ask-Token { Read-Host 'Telegram bot token from @BotFather' -AsSecureStr
 New-Item -ItemType Directory -Force $dir | Out-Null
 # Only the current user (and SYSTEM) may open the folder.
 icacls $dir /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
+
+if ($Calendars -and -not $ServiceAccountPath) {
+  # Re-serialise to strict JSON for the same reason as -Owners (see below).
+  $calendarMap = $Calendars | ConvertFrom-Json
+  Save-Secret 'calendars' (Secure ($calendarMap | ConvertTo-Json -Compress -Depth 4))
+  Write-Output 'Calendar feeds saved. Restart the task (or sign out and in) to use them.'
+  return
+}
 
 if ($UpdateToken) {
   Save-Secret 'telegram-token' $(if ($TelegramToken) { Secure $TelegramToken } else { Ask-Token })

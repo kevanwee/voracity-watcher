@@ -18,6 +18,7 @@ function Read-Secret([string]$name) {
 $env:TELEGRAM_BOT_TOKEN = Read-Secret 'telegram-token'
 $env:FIREBASE_SERVICE_ACCOUNT = Read-Secret 'service-account'
 $env:WATCHER_OWNERS = Read-Secret 'owners'
+if (Test-Path (Join-Path $dir 'calendars.secret')) { $env:WATCHER_CALENDARS = Read-Secret 'calendars' }
 
 Set-Location $config.repo
 Add-Content -Path $log -Encoding utf8 -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') listener starting"

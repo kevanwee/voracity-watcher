@@ -30,3 +30,24 @@ export function safeError(error: unknown) {
     : (error as { code?: unknown })?.code !== undefined ? `error code ${String((error as { code: unknown }).code).slice(0, 40)}`
     : (error as Error)?.name ?? 'unknown error';
 }
+
+/**
+ * Optional WATCHER_CALENDARS: {"<notes UID>": ["<secret iCal address>", …]}. The addresses
+ * are credentials (anyone with one can read that calendar), so they live only in secrets.
+ */
+export function calendars(): Record<string, string[]> {
+  const raw = secret('WATCHER_CALENDARS');
+  if (!raw) return {};
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new SetupError('WATCHER_CALENDARS must be JSON like {"<notes UID>": ["<secret iCal address>"]}'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new SetupError('WATCHER_CALENDARS must be a JSON object');
+  const result: Record<string, string[]> = {};
+  for (const [uid, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const urls = (Array.isArray(value) ? value : [value]).filter((url): url is string => {
+      try { return typeof url === 'string' && new URL(url).protocol === 'https:'; } catch { return false; }
+    });
+    if (/^[A-Za-z0-9_-]{1,128}$/.test(uid) && urls.length) result[uid] = urls.slice(0, 5);
+  }
+  return result;
+}
+

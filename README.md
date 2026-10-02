@@ -124,8 +124,20 @@ Ica's daily messages) at `users/{uid}/settings/assistant`:
   repeats.
 - With the briefing off, the morning message is sent only when something is due.
 
-Google Calendar events aren't included. That would need a stored Google refresh
-token, which Voracity deliberately never keeps on a server.
+**Calendar:** connect Google Calendar read-only through its *secret address in iCal
+format*. No OAuth token is stored anywhere. Events appear in the briefing and in
+answers to questions:
+
+1. In Google Calendar on the web, open **Settings → (your calendar) → Integrate calendar**
+   and copy **Secret address in iCal format**. Anyone with this link can read that
+   calendar, so treat it like a password; **Reset** there revokes it.
+2. Add it as the `WATCHER_CALENDARS` Actions secret, as
+   `{"<notes UID>": ["<secret address>"]}`. Several calendars per owner are allowed.
+   For the PC listener, run
+   `install.ps1 -Calendars '{"<notes UID>":["<secret address>"]}'`.
+
+Repeating events, skipped and moved occurrences, all-day events and time zones are
+handled (Mozilla's `ical.js`). Ica can read the calendar but can't add events to it.
 
 ## Quick capture
 
@@ -148,6 +160,39 @@ saved until you tap Save.
 **When your PC is off,** the cloud runner picks up waiting messages on its next run
 (within about 5–15 minutes), so capture still works from your phone. `/check` then
 explains that the PC watches will resume when the PC is back.
+
+## Changing things
+
+Every change asks first (**Mark done / Update / Delete** or **Cancel**). Each write is
+checked against the card's revision, so an edit made elsewhere in the meantime is
+never overwritten; Ica tells you to send the request again instead.
+
+| Message | What happens |
+| --- | --- |
+| `/done file the brief` | Mark a reminder done (it moves to Archive in Voracity) |
+| `/move pay rent to Monday` (or `/due pay rent tomorrow`) | Change a reminder's due date |
+| `/delete old idea` | Delete a card |
+| ✓ buttons under the briefing and reminder alerts | One tap marks that reminder done |
+
+If several cards match, Ica lists up to three to choose from.
+
+## Questions
+
+Anything that isn't a command or a capture goes to the AI on your PC: your Ollama
+model from Voracity's Second Brain settings (default `qwen3:14b`), and only ever on
+`localhost`.
+
+- **What it can look up:** reminders (by day, week or date range), cards, the reading
+  list, watches and the calendar.
+- **What it can change:** nothing directly. It can only propose a change, which you
+  confirm with a button.
+- **Examples:** "what's due before my exam?", "what's on tomorrow?", "move pay rent to
+  Monday", "mark the brief done".
+- **Limits:** each question allows 4 model rounds, 8 tool calls and 3 minutes. Your
+  open reminders and the next 14 days' dates are given to the model up front, so it
+  never guesses dates.
+- **Nothing leaves your PC,** and questions aren't logged.
+- **When the PC is off,** Ica says so. There is no cloud AI fallback.
 
 ## Asking Ica to check
 
@@ -237,6 +282,8 @@ these paths for each owner listed in `WATCHER_OWNERS`:
 | `users/{uid}/settings/assistant` | read | Briefing, alerts, morning time, time zone (written by Voracity) |
 | `users/{uid}/cards`, `bookmarks` | read; create on Save | Unfinished reminders and unread links for messages; new items only after you tap Save |
 | `users/{uid}/assistant/schedule`, `inbox` | read/write | Which mornings and reminders were sent; unconfirmed proposals. Not readable by browsers |
+| `users/{uid}/cards/{id}` | update / delete on confirm | Done, due date, title, or deletion, only if the revision is unchanged |
+| `users/{uid}/settings/brain` | read (PC only) | Which local Ollama model answers questions |
 
 Alerts for an owner go only to that owner's chat. If Telegram is unreachable, the old
 snapshot is kept, so the change is reported on a later run.
