@@ -11,7 +11,8 @@
   "scripts": {
     "watch": "node src/main.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "listen": "node src/listen-main.ts"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
