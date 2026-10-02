@@ -6,7 +6,8 @@ import { listen } from './listen.ts';
 try {
   const token = secret('TELEGRAM_BOT_TOKEN');
   if (!token) throw new SetupError('TELEGRAM_BOT_TOKEN is not set');
-  await listen({ token, owners: owners(), store: firestoreStore(serviceAccount()), base: {}, log: line => console.log(line) });
+  const log = (line: string) => console.log(line);
+  await listen({ token, owners: owners(), store: firestoreStore(serviceAccount()), base: { log }, log });
 } catch (error) {
   console.error(`Watcher listener failed: ${safeError(error)}`);
   process.exitCode = 1;
