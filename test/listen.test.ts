@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { makeHandler, makeQueue, parseCommand, pollOnce, type ListenDeps, type Update } from '../src/listen.ts';
+import { drainOnce, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from '../src/run.ts';
 
 const UID = 'owner1', CHAT = '4242', TOKEN = 'T';
@@ -7,20 +7,36 @@ const watch = (over: Partial<Watch> = {}): Watch => ({ id: 'w1', label: 'EX13 si
 
 function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
   const states = new Map(Object.entries(seed)), items = new Map<string, ItemsDoc>();
-  const store: Store = {
+  let inbox: Record<string, Pending> = {};
+  const cards: NewCard[] = [], bookmarks: NewBookmark[] = [];
+  const store: Store & CaptureStore = {
     watches: async () => watches, states: async () => new Map(states), items: async () => new Map(items),
     save: async (_u, id, state, doc) => { states.set(id, state); if (doc) items.set(id, doc); },
     removeItems: async () => {}, heartbeat: async () => {},
+    settings: async () => ({ timezone: 'Asia/Singapore' }),
+    inbox: async () => structuredClone(inbox), saveInbox: async (_u, pending) => { inbox = structuredClone(pending); },
+    createCard: async (_u, card) => { cards.push(card); }, createBookmark: async (_u, bookmark) => { bookmarks.push(bookmark); },
   };
   let clock = 1_800_000_000_000;
-  const sent: string[] = [], pages: string[] = [];
+  const sent: string[] = [], pages: string[] = [], edits: string[] = [], buttons: unknown[] = [];
+  let offsets: number[] = [];
+  let pendingUpdates: Update[] = [];
   const fetcher = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.startsWith(`https://api.telegram.org/bot${TOKEN}/sendMessage`)) {
       const body = JSON.parse(String(init?.body));
       expect(body.chat_id).toBe(CHAT);
       sent.push(body.text);
+      if (body.reply_markup) buttons.push(body.reply_markup.inline_keyboard);
       return new Response('{"ok":true}');
+    }
+    if (url.includes('/editMessageText')) { edits.push(JSON.parse(String(init?.body)).text); return new Response('{"ok":true}'); }
+    if (url.includes('/answerCallbackQuery')) return new Response('{"ok":true}');
+    if (url.includes('/getUpdates')) {
+      const offset = Number(new URL(url).searchParams.get('offset'));
+      offsets.push(offset);
+      const result = pendingUpdates.filter(u => u.update_id >= offset);
+      return new Response(JSON.stringify({ ok: true, result }));
     }
     if (url.endsWith('/robots.txt')) return new Response('', { status: 404 });
     pages.push(url);
@@ -29,7 +45,10 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
   const deps: ListenDeps = { token: TOKEN, owners: { [UID]: CHAT }, store, fetcher, now: () => clock, base: { fetcher, now: () => clock, sleep: async ms => { clock += ms; } } };
   const handle = makeHandler(deps, makeQueue());
   const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
-  return { deps, handle, message, sent, pages, states, advance: (ms: number) => { clock += ms; } };
+  const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
+  const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
+  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, lastButtons, inbox: () => inbox,
+    queue: (updates: Update[]) => { pendingUpdates = updates; }, offsets: () => offsets, advance: (ms: number) => { clock += ms; } };
 }
 
 describe('commands', () => {
@@ -104,6 +123,78 @@ describe('commands', () => {
   });
 });
 
+describe('quick capture', () => {
+  // The fake clock starts at 1_800_000_000_000 ms: Friday 15 January 2027, 16:00 in Singapore.
+  it('proposes a reminder with a parsed due date and saves it only after Save', async () => {
+    const s = setup([]);
+    await s.handle(s.message('remind me to file the brief Monday'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nSave this reminder?\n<b>File the brief</b>\nDue: Mon 18 Jan');
+    expect(s.cards).toEqual([]);
+    const [[save, cancel]] = s.lastButtons();
+    expect([save.text, cancel.text]).toEqual(['Save', 'Cancel']);
+    await s.handle(s.tap(save.callback_data));
+    expect(s.cards).toHaveLength(1);
+    expect(s.cards[0]).toMatchObject({ kind: 'reminder', title: 'File the brief', body: '', url: '', dueDate: '2027-01-18', done: false, pinned: false, tone: 'cream', revision: 0 });
+    expect(Object.keys(s.cards[0]).sort()).toEqual(['body', 'createdAt', 'done', 'dueDate', 'id', 'kind', 'pinned', 'revision', 'title', 'tone', 'updatedAt', 'url']);
+    expect(s.edits.at(-1)).toContain('Saved to My Space ✓');
+    expect(s.inbox()).toEqual({});
+    // Tapping again does nothing more.
+    await s.handle(s.tap(save.callback_data));
+    expect(s.cards).toHaveLength(1);
+    expect(s.edits.at(-1)).toContain('expired or was already handled');
+  });
+
+  it('cancels, saves notes and reading-list links, and ignores other chats', async () => {
+    const s = setup([]);
+    await s.handle(s.message('note: book the venue\nfor 40 people'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nSave this note to My Space?\n<b>Book the venue</b>\nfor 40 people');
+    await s.handle(s.tap(s.lastButtons()[0][1].callback_data));
+    expect(s.edits.at(-1)).toContain("OK, I didn't save it.");
+    await s.handle(s.message('https://example.com/article?id=1'));
+    expect(s.sent.at(-1)).toContain('Add to your reading list?\n<b>example.com</b>');
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data, 999)); // a stranger's tap
+    expect(s.bookmarks).toEqual([]);
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.bookmarks[0]).toMatchObject({ url: 'https://example.com/article?id=1', title: 'example.com', snippet: '', tags: [], status: 'unread', revision: 0 });
+    expect(s.cards).toEqual([]);
+    await s.handle(s.message('remind me to call mum', 999));
+    expect(s.inbox()).toEqual({});
+  });
+
+  it('accepts capture messages sent while the PC was off, but forgets proposals after a day', async () => {
+    const s = setup([]);
+    await s.handle(s.message('remind me to pay rent tomorrow', Number(CHAT), 3 * 3600));
+    expect(s.sent.at(-1)).toContain('<b>Pay rent</b>\nDue: tomorrow');
+    const save = s.lastButtons()[0][0].callback_data;
+    s.advance(25 * 3_600_000);
+    await s.handle(s.tap(save));
+    expect(s.cards).toEqual([]);
+    expect(s.edits.at(-1)).toContain('expired');
+  });
+
+  it('explains unclear messages', async () => {
+    const s = setup([]);
+    await s.handle(s.message('remind me to'));
+    expect(s.sent.at(-1)).toContain('What should I remind you about?');
+    await s.handle(s.message('what is the weather'));
+    expect(s.sent.at(-1)).toContain("I didn't catch that");
+  });
+
+  it('in the cloud, answers messages, declines /check, and acknowledges what it handled', async () => {
+    const s = setup([watch()]);
+    const now = Math.floor(1_800_000_000_000 / 1000);
+    s.queue([
+      { update_id: 41, message: { date: now, text: '/check', chat: { id: Number(CHAT) } } },
+      { update_id: 42, message: { date: now, text: 'remind me to water plants today', chat: { id: Number(CHAT) } } },
+    ]);
+    await drainOnce(s.deps);
+    expect(s.pages).toEqual([]);
+    expect(s.sent[0]).toContain("Your PC is off or asleep, so I can't check its watches");
+    expect(s.sent[1]).toContain('<b>Water plants</b>\nDue: today');
+    expect(s.offsets()).toEqual([0, 43]); // the second call confirms both updates
+  });
+});
+
 describe('queue and polling', () => {
   it('runs jobs one at a time, in order, even when one fails', async () => {
     const enqueue = makeQueue(), order: string[] = [];
@@ -117,7 +208,7 @@ describe('queue and polling', () => {
   it('advances the offset past every update', async () => {
     const handled: number[] = [];
     const fetcher = (async () => new Response(JSON.stringify({ ok: true, result: [{ update_id: 7 }, { update_id: 9 }] }))) as unknown as typeof fetch;
-    const next = await pollOnce({ token: TOKEN, owners: {}, store: {} as Store, base: {}, fetcher }, 0, async update => { handled.push(update.update_id); }, 0);
+    const next = await pollOnce({ token: TOKEN, owners: {}, store: {} as ListenDeps['store'], base: {}, fetcher }, 0, async update => { handled.push(update.update_id); }, 0);
     expect(next).toBe(10);
     expect(handled).toEqual([7, 9]);
   });

@@ -1,20 +1,32 @@
-// The local runner as one long-running process: it runs the 5-minute schedule and
-// answers the owner's Telegram commands, all through a single queue so a requested
-// check can never overlap a scheduled one (no duplicate alerts).
-import { GREETING, escapeHtml, sendTelegram } from './telegram.ts';
+// Ica's Telegram side. On the owner's PC this is a long-running listener that also runs
+// the 5-minute schedule, all through one queue so a requested check never overlaps a
+// scheduled one. When the PC is off, the cloud runner reads pending messages instead
+// (mode 'cloud'), so quick capture still works from a phone.
+import { localClock, settingsFrom, type AssistantSettings } from './assistant.ts';
+import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
+import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
 export const SCHEDULE_MS = 5 * 60_000;
-/** Commands sent while the PC was off are not run late; Ica says so instead. */
+/** Check commands sent while the PC was off are not run late; Ica says so instead. */
 export const STALE_COMMAND_S = 10 * 60;
+/** Unconfirmed proposals are forgotten after a day (Telegram also keeps updates for 24 h). */
+export const PROPOSAL_TTL_MS = 86_400_000;
 
 export const COMMANDS = [
   { command: 'check', description: 'Check your PC watches now (add a name to check one)' },
   { command: 'status', description: 'Show each watch and its last check' },
+  { command: 'remind', description: 'Add a reminder, e.g. /remind file the brief Friday' },
+  { command: 'note', description: 'Add a note to My Space' },
+  { command: 'save', description: 'Add a link to your reading list' },
   { command: 'help', description: 'What Ica can do' },
 ];
 
-export interface Update { update_id: number; message?: { date: number; text?: string; chat: { id: number } } }
+export interface Update {
+  update_id: number;
+  message?: { date: number; text?: string; chat: { id: number } };
+  callback_query?: { id: string; data?: string; message?: { message_id: number; chat: { id: number } } };
+}
 
 export type Command = { name: 'check'; filter: string } | { name: 'status' } | { name: 'help' } | null;
 
@@ -24,8 +36,8 @@ export function parseCommand(text: string | undefined): Command {
   if (!match) return null;
   const name = match[1].toLowerCase(), rest = (match[2] ?? '').trim();
   if (name === 'check') return { name: 'check', filter: rest };
-  if (name === 'status') return { name: 'status' };
-  if (name === 'help' || name === 'start') return { name: 'help' };
+  if (name === 'status' && !rest) return { name: 'status' };
+  if ((name === 'help' || name === 'start') && !rest) return { name: 'help' };
   return null;
 }
 
@@ -38,10 +50,16 @@ const ago = (ms: number, now: number) => {
 };
 
 export function helpReply() {
-  return [GREETING, 'I watch your sites and tell you when they change.',
-    '/check: check your PC watches now',
-    '/check <name>: check the watches whose name contains it',
-    '/status: each watch, where it is checked from, and its last check'].join('\n');
+  return [GREETING, 'I watch your sites, send your morning briefing and keep your reminders.',
+    '',
+    '<b>Add things</b> (I ask before saving)',
+    '“remind me to file the brief Friday”',
+    '“note: book the venue”',
+    'a link on its own, or /save &lt;link&gt;: reading list',
+    '',
+    '<b>Watches</b>',
+    '/check: check your PC watches now (/check &lt;name&gt; for one)',
+    '/status: each watch and its last check'].join('\n');
 }
 
 const OUTCOME_LABEL: Record<Outcome['kind'], string> = { changed: '🆕', unchanged: '✓', baseline: '👀', failed: '⚠️', moved: '↪', waiting: '⏳' };
@@ -69,11 +87,47 @@ export function statusReply(watches: Watch[], states: Map<string, WatchState>, n
   })].join('\n');
 }
 
+export function proposalText(p: Proposal, today: string) {
+  if (p.kind === 'bookmark') return `${GREETING}\nAdd to your reading list?\n<b>${escapeHtml(p.title)}</b>\n${escapeHtml(p.url)}`;
+  const body = p.body ? `\n${escapeHtml(p.body.length > 200 ? p.body.slice(0, 199) + '…' : p.body)}` : '';
+  if (p.kind === 'note') return `${GREETING}\nSave this note to My Space?\n<b>${escapeHtml(p.title)}</b>${body}`;
+  return `${GREETING}\nSave this reminder?\n<b>${escapeHtml(p.title)}</b>${body}\nDue: ${formatDue(p.dueDate, today)}`;
+}
+
+function savedText(p: Proposal, today: string) {
+  if (p.kind === 'bookmark') return `Added to your reading list ✓\n<b>${escapeHtml(p.title)}</b>`;
+  if (p.kind === 'note') return `Saved to My Space ✓\n<b>${escapeHtml(p.title)}</b>`;
+  return `Saved to My Space ✓\n<b>${escapeHtml(p.title)}</b>, due ${formatDue(p.dueDate, today)}`;
+}
+
+/** Card and bookmark documents exactly as Voracity creates them (model.ts, bookmarks.ts, firestore.rules). */
+export function cardFor(p: Exclude<Proposal, { kind: 'bookmark' }>, now: number) {
+  return { id: crypto.randomUUID(), kind: p.kind, title: p.title.slice(0, LIMITS.title), body: p.body.slice(0, LIMITS.body), url: '',
+    dueDate: p.kind === 'reminder' ? p.dueDate : '', done: false, pinned: false, tone: 'cream', createdAt: now, updatedAt: now, revision: 0 };
+}
+export function bookmarkFor(p: Extract<Proposal, { kind: 'bookmark' }>, now: number) {
+  return { id: crypto.randomUUID(), url: p.url, title: p.title.slice(0, LIMITS.bookmarkTitle), snippet: '', tags: [] as string[], status: 'unread', createdAt: now, updatedAt: now, revision: 0 };
+}
+export type NewCard = ReturnType<typeof cardFor>;
+export type NewBookmark = ReturnType<typeof bookmarkFor>;
+
+export type Pending = Proposal & { createdAt: number };
+export interface CaptureStore {
+  settings(uid: string): Promise<Partial<AssistantSettings> | null>;
+  /** Runner-only: users/{uid}/assistant/inbox. */
+  inbox(uid: string): Promise<Record<string, Pending>>;
+  saveInbox(uid: string, pending: Record<string, Pending>): Promise<void>;
+  createCard(uid: string, card: NewCard): Promise<void>;
+  createBookmark(uid: string, bookmark: NewBookmark): Promise<void>;
+}
+
 export interface ListenDeps {
   token: string;
   owners: Record<string, string>;
-  store: Store;
+  store: Store & CaptureStore;
   base: Omit<Deps, 'owners' | 'store' | 'send' | 'runner' | 'manual' | 'test'>;
+  /** 'local' (the PC listener, default) can run /check; 'cloud' answers while the PC is off. */
+  mode?: 'local' | 'cloud';
   fetcher?: typeof fetch;
   now?: () => number;
   log?: (line: string) => void;
@@ -89,68 +143,126 @@ export function makeQueue() {
   };
 }
 
+const proposalId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+
 export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQueue>) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => {});
-  const send = (chatId: string, text: string) => sendTelegram(deps.token, chatId, text, deps.fetcher);
+  const send = (chatId: string, text: string, buttons?: { text: string; data: string }[][]) => sendTelegram(deps.token, chatId, text, deps.fetcher, buttons);
+  const call = (method: string, payload: Record<string, unknown>) => telegramCall(deps.token, method, payload, deps.fetcher);
   const ownerByChat = new Map(Object.entries(deps.owners).map(([uid, chat]) => [chat, uid]));
+  const today = async (uid: string) => localClock(now(), settingsFrom(await deps.store.settings(uid)).timezone).date;
+  const livePending = async (uid: string) =>
+    Object.fromEntries(Object.entries(await deps.store.inbox(uid)).filter(([, p]) => now() - p.createdAt < PROPOSAL_TTL_MS));
   let checking = false;
+
+  async function confirm(update: NonNullable<Update['callback_query']>) {
+    const chatId = String(update.message?.chat.id ?? ''), uid = ownerByChat.get(chatId);
+    if (!uid || !update.message) return;
+    const [action, id] = (update.data ?? '').split(':');
+    await call('answerCallbackQuery', { callback_query_id: update.id }).catch(() => undefined);
+    const pending = await livePending(uid);
+    const proposal = pending[id];
+    const edit = (text: string) => call('editMessageText', { chat_id: chatId, message_id: update.message!.message_id, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+    if (!proposal) { await edit(`${GREETING}\nThat one expired or was already handled. Send it again if you still want it.`); return; }
+    delete pending[id];
+    if (action === 'save') {
+      const { createdAt: _created, ...p } = proposal;
+      if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
+      else await deps.store.createCard(uid, cardFor(p, now()));
+      await deps.store.saveInbox(uid, pending);
+      await edit(`${GREETING}\n${savedText(p, await today(uid))}`);
+      log(`capture saved: ${p.kind}`);
+    } else {
+      await deps.store.saveInbox(uid, pending);
+      await edit(`${GREETING}\nOK, I didn't save it.`);
+    }
+  }
+
   return async function handle(update: Update) {
+    if (update.callback_query) { await confirm(update.callback_query); return; }
     const message = update.message;
     if (!message) return;
     const chatId = String(message.chat.id), uid = ownerByChat.get(chatId);
-    if (!uid) return; // Only owners in WATCHER_OWNERS can command Ica; everyone else is ignored.
+    if (!uid) return; // Only owners in WATCHER_OWNERS can talk to Ica; everyone else is ignored.
     const command = parseCommand(message.text);
-    if (!command) { await send(chatId, `${GREETING}\nI didn't catch that. Try /check or /status.`); return; }
-    if (now() / 1000 - message.date > STALE_COMMAND_S) {
-      await send(chatId, `${GREETING}\nYour PC was off when you sent that, so I didn't run it late. Send it again if you still want it.`);
-      return;
-    }
-    if (command.name === 'help') { await send(chatId, helpReply()); return; }
-    if (command.name === 'status') {
+    if (command?.name === 'help') { await send(chatId, helpReply()); return; }
+    if (command?.name === 'status') {
       const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
       await send(chatId, statusReply(watches, states, now()));
       return;
     }
-    if (checking) { await send(chatId, `${GREETING}\nI'm already checking. Results are on their way.`); return; }
-    checking = true;
-    try {
-      const filter = command.filter.toLowerCase();
-      const match = (watch: Watch) => !filter || watch.label.toLowerCase().includes(filter);
-      await send(chatId, `${GREETING}\nChecking${filter ? ` “${escapeHtml(command.filter)}”` : ''} now…`);
-      const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send, runner: 'local', manual: { uid, match } }));
-      const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
-      const cloud = watches.filter(watch => watch.enabled && match(watch) && routeOf(states.get(watch.id), watch) === 'cloud').map(watch => watch.label);
-      await send(chatId, checkReply(totals.outcomes, cloud, command.filter));
-      log(`command check: ${totals.outcomes.length} watches, ${totals.changed} changed`);
-    } finally { checking = false; }
+    if (command?.name === 'check') {
+      if (now() / 1000 - message.date > STALE_COMMAND_S) {
+        await send(chatId, `${GREETING}\nYour PC was off when you sent that, so I didn't run it late. Send it again if you still want it.`);
+        return;
+      }
+      if (deps.mode === 'cloud') {
+        await send(chatId, `${GREETING}\nYour PC is off or asleep, so I can't check its watches right now. They resume when it's back; /status shows the latest.`);
+        return;
+      }
+      if (checking) { await send(chatId, `${GREETING}\nI'm already checking. Results are on their way.`); return; }
+      checking = true;
+      try {
+        const filter = command.filter.toLowerCase();
+        const match = (watch: Watch) => !filter || watch.label.toLowerCase().includes(filter);
+        await send(chatId, `${GREETING}\nChecking${filter ? ` “${escapeHtml(command.filter)}”` : ''} now…`);
+        const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match } }));
+        const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
+        const cloud = watches.filter(watch => watch.enabled && match(watch) && routeOf(states.get(watch.id), watch) === 'cloud').map(watch => watch.label);
+        await send(chatId, checkReply(totals.outcomes, cloud, command.filter));
+        log(`command check: ${totals.outcomes.length} watches, ${totals.changed} changed`);
+      } finally { checking = false; }
+      return;
+    }
+    const date = await today(uid);
+    const captured = parseCapture(message.text ?? '', date);
+    if (!captured) { await send(chatId, `${GREETING}\nI didn't catch that. Try “remind me to … Friday”, “note: …”, a link, /check or /help.`); return; }
+    if ('error' in captured) { await send(chatId, `${GREETING}\n${escapeHtml(captured.error)}`); return; }
+    const pending = await livePending(uid);
+    const id = proposalId();
+    pending[id] = { ...captured, createdAt: now() };
+    await deps.store.saveInbox(uid, pending);
+    await send(chatId, proposalText(captured, date), [[{ text: 'Save', data: `save:${id}` }, { text: 'Cancel', data: `cancel:${id}` }]]);
+    log(`capture proposed: ${captured.kind}`);
   };
 }
+
+const UPDATES = encodeURIComponent('["message","callback_query"]');
 
 /** Long-poll Telegram for one batch of updates; returns the next offset. */
 export async function pollOnce(deps: ListenDeps, offset: number, handle: (update: Update) => Promise<void>, timeoutS = 50) {
   const base = process.env.TELEGRAM_API ?? 'https://api.telegram.org';
-  const url = `${base}/bot${deps.token}/getUpdates?timeout=${timeoutS}&offset=${offset}&allowed_updates=${encodeURIComponent('["message"]')}`;
+  const url = `${base}/bot${deps.token}/getUpdates?timeout=${timeoutS}&offset=${offset}&allowed_updates=${UPDATES}`;
   const response = await (deps.fetcher ?? fetch)(url, { signal: AbortSignal.timeout((timeoutS + 15) * 1000) });
   if (!response.ok) throw new Error(`Telegram getUpdates returned HTTP ${response.status}`);
   const body = await response.json() as { result?: Update[] };
   let next = offset;
   for (const update of body.result ?? []) {
     next = Math.max(next, update.update_id + 1);
-    try { await handle(update); } catch { deps.log?.('command failed'); }
+    try { await handle(update); } catch { deps.log?.('message handling failed'); }
   }
   return next;
+}
+
+/**
+ * The cloud runner's stand-in while the PC is off: handle whatever is waiting, then
+ * acknowledge it so neither runner sees it again.
+ */
+export async function drainOnce(deps: ListenDeps) {
+  const handle = makeHandler({ ...deps, mode: 'cloud' }, makeQueue());
+  const next = await pollOnce(deps, 0, handle, 0);
+  if (next > 0) await pollOnce(deps, next, async () => {}, 0);
 }
 
 export async function listen(deps: ListenDeps) {
   const log = deps.log ?? (() => {});
   const enqueue = makeQueue();
-  const handle = makeHandler(deps, enqueue);
+  const handle = makeHandler({ ...deps, mode: 'local' }, enqueue);
   const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local',
     send: (chatId, text) => sendTelegram(deps.token, chatId, text, deps.fetcher) })).catch(() => log('scheduled run failed'));
-  const base = process.env.TELEGRAM_API ?? 'https://api.telegram.org';
   // Show the commands in Telegram's "/" menu.
-  await (deps.fetcher ?? fetch)(`${base}/bot${deps.token}/setMyCommands`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commands: COMMANDS }) }).catch(() => undefined);
+  await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS }, deps.fetcher).catch(() => undefined);
   void scheduled();
   setInterval(() => void scheduled(), SCHEDULE_MS);
   log('listening for commands');

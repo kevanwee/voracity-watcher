@@ -54,12 +54,11 @@ export function handoffMessage(label: string, url: string, status: number) {
   return [GREETING, `<b>${escapeHtml(label)}</b> refuses GitHub's servers (HTTP ${status}), so your PC checks it from now on. GitHub won't contact this site again.`, link(url, 'Open the page')].join('\n');
 }
 
-/** Send one message. Telegram rate limits (429) are retried once after retry_after. */
-export async function sendTelegram(token: string, chatId: string, text: string, fetcher: typeof fetch = fetch) {
+/** Call a Bot API method. Telegram rate limits (429) are retried once after retry_after. */
+export async function telegramCall(token: string, method: string, payload: Record<string, unknown>, fetcher: typeof fetch = fetch) {
   const base = process.env.TELEGRAM_API ?? 'https://api.telegram.org';
-  const send = () => fetcher(`${base}/bot${token}/sendMessage`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }),
+  const send = () => fetcher(`${base}/bot${token}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15_000), body: JSON.stringify(payload),
   });
   let response = await send();
   if (response.status === 429) {
@@ -68,4 +67,13 @@ export async function sendTelegram(token: string, chatId: string, text: string, 
     response = await send();
   }
   if (!response.ok) throw new Error(`Telegram returned HTTP ${response.status}`);
+  return response;
+}
+
+/** Send one HTML message, optionally with inline buttons. */
+export async function sendTelegram(token: string, chatId: string, text: string, fetcher: typeof fetch = fetch, buttons?: { text: string; data: string }[][]) {
+  await telegramCall(token, 'sendMessage', {
+    chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true },
+    ...(buttons ? { reply_markup: { inline_keyboard: buttons.map(row => row.map(b => ({ text: b.text, callback_data: b.data }))) } } : {}),
+  }, fetcher);
 }
