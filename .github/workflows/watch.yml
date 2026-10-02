@@ -23,15 +23,25 @@ jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    env:
+      # Until the secrets are added, runs finish quietly instead of failing every 5 minutes.
+      CONFIGURED: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.WATCHER_OWNERS != '' && secrets.FIREBASE_SERVICE_ACCOUNT != '' }}
     steps:
+      - name: Setup pending
+        if: env.CONFIGURED != 'true'
+        run: echo "Not configured yet. Add TELEGRAM_BOT_TOKEN, FIREBASE_SERVICE_ACCOUNT and WATCHER_OWNERS (see README)."
       - uses: actions/checkout@v5
+        if: env.CONFIGURED == 'true'
       - uses: actions/setup-node@v5
+        if: env.CONFIGURED == 'true'
         with:
           node-version: 24
           cache: npm
       - run: npm ci --omit=dev --ignore-scripts
+        if: env.CONFIGURED == 'true'
       # Logs are public: the runner prints counts only, never addresses or content.
       - run: npm run watch
+        if: env.CONFIGURED == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
