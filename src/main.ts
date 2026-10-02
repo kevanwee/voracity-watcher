@@ -6,9 +6,12 @@ import { sendTelegram } from './telegram.ts';
 // IDs, watched addresses or page content: only fixed messages and counts.
 class SetupError extends Error {}
 
+/** Secrets pasted through Windows PowerShell 5.1 can arrive with a byte-order mark or a trailing newline. */
+const secret = (name: string) => process.env[name]?.replace(/^﻿/, '').trim() || undefined;
+
 function owners(): Record<string, string> {
   let parsed: unknown;
-  try { parsed = JSON.parse(process.env.WATCHER_OWNERS ?? ''); } catch { throw new SetupError('WATCHER_OWNERS must be JSON like {"<notes UID>": "<Telegram chat ID>"}'); }
+  try { parsed = JSON.parse(secret('WATCHER_OWNERS') ?? ''); } catch { throw new SetupError('WATCHER_OWNERS must be JSON like {"<notes UID>": "<Telegram chat ID>"}'); }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new SetupError('WATCHER_OWNERS must be a JSON object');
   const entries = Object.entries(parsed as Record<string, unknown>).filter(([uid, chat]) => /^[A-Za-z0-9_-]{1,128}$/.test(uid) && /^-?\d{1,20}$/.test(String(chat)));
   if (!entries.length) throw new SetupError('WATCHER_OWNERS has no valid owner entries');
@@ -17,14 +20,14 @@ function owners(): Record<string, string> {
 
 function serviceAccount() {
   if (process.env.FIRESTORE_EMULATOR_HOST) return undefined;
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  const raw = secret('FIREBASE_SERVICE_ACCOUNT');
   if (!raw) throw new SetupError('FIREBASE_SERVICE_ACCOUNT is not set');
   try { JSON.parse(raw); } catch { throw new SetupError('FIREBASE_SERVICE_ACCOUNT is not valid JSON; paste the whole key file'); }
   return raw;
 }
 
 try {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const token = secret('TELEGRAM_BOT_TOKEN');
   if (!token) throw new SetupError('TELEGRAM_BOT_TOKEN is not set');
   await runOnce({
     owners: owners(),
