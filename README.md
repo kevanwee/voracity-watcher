@@ -1,6 +1,8 @@
 # voracity-watcher
 
-The scheduled runner behind [Voracity](https://voracity.web.app)'s **Site watcher**.
+The scheduled runner behind [Voracity](https://voracity.web.app)'s **Site watcher**
+and **Ica**, its Telegram assistant: page-change alerts, a morning briefing,
+reminder alerts, and quick capture of reminders, notes and links by message.
 Every five minutes, GitHub Actions checks the pages you have listed in Voracity.
 When something changes, Ica, a Telegram bot, sends you a message:
 
@@ -107,6 +109,46 @@ your PC's watches every 5 minutes and answers Telegram commands.
 - **Changing the token:** `install.ps1 -UpdateToken`.
 - **Removing everything:** `install.ps1 -Uninstall`.
 
+## Ica's daily messages
+
+The cloud runner sends these. It is always on, and for these messages it reads
+Firestore only, never a website. Settings live in Voracity (Tech Tools → Site watcher →
+Ica's daily messages) at `users/{uid}/settings/assistant`:
+
+- **Morning briefing** (default 08:00 in your time zone): reminders due today, still
+  open, and due tomorrow, plus watch changes since the last briefing and your unread
+  reading list. It is sent once a day. If the runner was down at that time, it arrives
+  late rather than never.
+- **Reminder alerts:** reminders due today are covered by the morning message. One you
+  add after the morning, due today, gets its own message within a run or two. Nothing
+  repeats.
+- With the briefing off, the morning message is sent only when something is due.
+
+Google Calendar events aren't included. That would need a stored Google refresh
+token, which Voracity deliberately never keeps on a server.
+
+## Quick capture
+
+Message Ica and she proposes a card with **Save** and **Cancel** buttons. Nothing is
+saved until you tap Save.
+
+| Message | Becomes |
+| --- | --- |
+| `remind me to file the brief Friday` | Reminder "File the brief", due the coming Friday |
+| `/remind renew licence 20/11` | Reminder due 20 November (dates are day-first) |
+| `note: book the venue` (extra lines become the body) | Note in My Space |
+| a link on its own, or `/save <link> [title]` | Reading-list item |
+
+- **Understood dates:** today, tomorrow, weekdays (always the next one, never today),
+  "in 3 days" or "in 2 weeks", `5 Oct`, `Oct 5`, `5/10` and `2026-10-05`.
+- **Proposals expire** after 24 hours.
+- **Saved items match the app:** cards and bookmarks are written exactly as Voracity
+  writes them, so they sync to every device straight away.
+
+**When your PC is off,** the cloud runner picks up waiting messages on its next run
+(within about 5–15 minutes), so capture still works from your phone. `/check` then
+explains that the PC watches will resume when the PC is back.
+
 ## Asking Ica to check
 
 Message Ica on Telegram. These commands also appear in the bot's `/` menu:
@@ -192,6 +234,9 @@ these paths for each owner listed in `WATCHER_OWNERS`:
 | `users/{uid}/watchState/{id}` | write | Status shown in Voracity: last check, item count, last change, error, backoff |
 | `users/{uid}/watchItems/{id}` | read/write | The previous item snapshot used for comparison; not readable by browsers |
 | `users/{uid}/watcher/status` | write | Heartbeats (`cloudRunAt`, `localRunAt`), so Voracity can warn if a runner stops |
+| `users/{uid}/settings/assistant` | read | Briefing, alerts, morning time, time zone (written by Voracity) |
+| `users/{uid}/cards`, `bookmarks` | read; create on Save | Unfinished reminders and unread links for messages; new items only after you tap Save |
+| `users/{uid}/assistant/schedule`, `inbox` | read/write | Which mornings and reminders were sent; unconfirmed proposals. Not readable by browsers |
 
 Alerts for an owner go only to that owner's chat. If Telegram is unreachable, the old
 snapshot is kept, so the change is reported on a later run.
