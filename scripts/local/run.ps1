@@ -10,7 +10,7 @@ New-Item -ItemType Directory -Force $logDir | Out-Null
 $log = Join-Path $logDir 'watcher.log'
 
 function Read-Secret([string]$name) {
-  $secure = Get-Content (Join-Path $dir "$name.secret") -Raw | ConvertTo-SecureString
+  $secure = (Get-Content (Join-Path $dir "$name.secret") -Raw).Trim() | ConvertTo-SecureString
   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
   try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }

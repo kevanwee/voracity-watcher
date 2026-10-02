@@ -48,7 +48,11 @@ if (-not $ServiceAccountPath -or -not (Test-Path $ServiceAccountPath)) { throw '
 $key = Get-Content $ServiceAccountPath -Raw
 $null = $key | ConvertFrom-Json
 if (-not $Owners) { throw 'Pass -Owners, for example ''{"<notes UID>":"<Telegram chat ID>"}'' (copy it from Voracity''s Site watcher setup).' }
-$null = $Owners | ConvertFrom-Json
+# Re-serialise to strict JSON: Windows PowerShell strips embedded double quotes from
+# arguments passed to another process, and its parser accepts the unquoted result.
+$ownerMap = $Owners | ConvertFrom-Json
+$Owners = $ownerMap | ConvertTo-Json -Compress
+if ($Owners -notmatch '^\{"[A-Za-z0-9_-]+":') { throw 'Could not read -Owners as {"<notes UID>":"<Telegram chat ID>"}.' }
 
 Save-Secret 'service-account' (Secure $key)
 Save-Secret 'owners' (Secure $Owners)
