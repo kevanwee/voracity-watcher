@@ -2,8 +2,10 @@
 // the 5-minute schedule, all through one queue so a requested check never overlaps a
 // scheduled one. When the PC is off, the cloud runner reads pending messages instead
 // (mode 'cloud'), so quick capture still works from a phone.
-import { localClock, settingsFrom, type AssistantSettings } from './assistant.ts';
+import { DEFAULT_OLLAMA, answerQuestion, localOllamaUrl } from './agent.ts';
+import { localClock, settingsFrom, type AssistantSettings, type Bookmark } from './assistant.ts';
 import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
+import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
@@ -19,6 +21,9 @@ export const COMMANDS = [
   { command: 'remind', description: 'Add a reminder, e.g. /remind file the brief Friday' },
   { command: 'note', description: 'Add a note to My Space' },
   { command: 'save', description: 'Add a link to your reading list' },
+  { command: 'done', description: 'Mark a reminder done, e.g. /done file the brief' },
+  { command: 'move', description: 'Change a due date, e.g. /move file the brief to Monday' },
+  { command: 'delete', description: 'Delete a card from My Space' },
   { command: 'help', description: 'What Ica can do' },
 ];
 
@@ -56,6 +61,12 @@ export function helpReply() {
     '“remind me to file the brief Friday”',
     '“note: book the venue”',
     'a link on its own, or /save &lt;link&gt;: reading list',
+    '',
+    '<b>Change things</b> (I ask first)',
+    '/done &lt;reminder&gt;, /move &lt;reminder&gt; to &lt;day&gt;, /delete &lt;card&gt;',
+    '',
+    '<b>Ask me anything</b> (uses the AI on your PC)',
+    '“what’s due before my exam?”, “what’s on tomorrow?”, “move the brief to Monday”',
     '',
     '<b>Watches</b>',
     '/check: check your PC watches now (/check &lt;name&gt; for one)',
@@ -111,9 +122,12 @@ export function bookmarkFor(p: Extract<Proposal, { kind: 'bookmark' }>, now: num
 export type NewCard = ReturnType<typeof cardFor>;
 export type NewBookmark = ReturnType<typeof bookmarkFor>;
 
-export type Pending = Proposal & { createdAt: number };
-export interface CaptureStore {
+export type Pending = (Proposal | Change) & { createdAt: number };
+export interface CaptureStore extends EditStore {
   settings(uid: string): Promise<Partial<AssistantSettings> | null>;
+  /** The owner's Second Brain settings (users/{uid}/settings/brain): local model and address. */
+  brainSettings(uid: string): Promise<{ ollamaUrl?: string; ollamaModel?: string } | null>;
+  unreadBookmarks(uid: string): Promise<Bookmark[]>;
   /** Runner-only: users/{uid}/assistant/inbox. */
   inbox(uid: string): Promise<Record<string, Pending>>;
   saveInbox(uid: string, pending: Record<string, Pending>): Promise<void>;
@@ -126,8 +140,10 @@ export interface ListenDeps {
   owners: Record<string, string>;
   store: Store & CaptureStore;
   base: Omit<Deps, 'owners' | 'store' | 'send' | 'runner' | 'manual' | 'test'>;
-  /** 'local' (the PC listener, default) can run /check; 'cloud' answers while the PC is off. */
+  /** 'local' (the PC listener, default) can run /check and questions; 'cloud' answers while the PC is off. */
   mode?: 'local' | 'cloud';
+  /** Private iCal feed URLs per owner (WATCHER_CALENDARS). */
+  calendars?: Record<string, string[]>;
   fetcher?: typeof fetch;
   now?: () => number;
   log?: (line: string) => void;
@@ -143,7 +159,8 @@ export function makeQueue() {
   };
 }
 
-const proposalId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+// Short enough that a button can carry three sibling IDs within Telegram's 64-byte callback limit.
+const proposalId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 10);
 
 export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQueue>) {
   const now = deps.now ?? Date.now;
@@ -159,25 +176,68 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
   async function confirm(update: NonNullable<Update['callback_query']>) {
     const chatId = String(update.message?.chat.id ?? ''), uid = ownerByChat.get(chatId);
     if (!uid || !update.message) return;
-    const [action, id] = (update.data ?? '').split(':');
+    const [action, id, revision] = (update.data ?? '').split(':');
+    const edit = (text: string) => call('editMessageText', { chat_id: chatId, message_id: update.message!.message_id, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+    if (action === 'done') {
+      // One-tap "✓" from the briefing or a reminder alert: an explicit action, still revision-checked.
+      const card = (await deps.store.cards(uid)).find(c => c.id === id);
+      const result = !card ? 'missing' : card.done ? 'ok' : await deps.store.updateCard(uid, id, Number(revision), { done: true }, now());
+      const title = card?.title ?? 'That reminder';
+      const toast = result === 'ok' ? `✓ ${title} is done` : result === 'missing' ? `${title} no longer exists` : `${title} changed elsewhere; send /done to try again`;
+      await call('answerCallbackQuery', { callback_query_id: update.id, text: toast.slice(0, 190) }).catch(() => undefined);
+      log(`reminder done from button: ${result}`);
+      return;
+    }
     await call('answerCallbackQuery', { callback_query_id: update.id }).catch(() => undefined);
     const pending = await livePending(uid);
+    if (action === 'cancel') {
+      for (const one of id.split(',')) delete pending[one];
+      await deps.store.saveInbox(uid, pending);
+      await edit(`${GREETING}\nOK, I left it as it is.`);
+      return;
+    }
     const proposal = pending[id];
-    const edit = (text: string) => call('editMessageText', { chat_id: chatId, message_id: update.message!.message_id, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
     if (!proposal) { await edit(`${GREETING}\nThat one expired or was already handled. Send it again if you still want it.`); return; }
+    // Siblings offered in the same message (several matches) are dropped once one is chosen.
+    for (const sibling of (update.data ?? '').split(':')[2]?.split(',') ?? []) delete pending[sibling];
     delete pending[id];
-    if (action === 'save') {
-      const { createdAt: _created, ...p } = proposal;
-      if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
-      else await deps.store.createCard(uid, cardFor(p, now()));
+    const { createdAt: _created, ...p } = proposal;
+    const date = await today(uid);
+    if (isChange(p)) {
+      const result = await applyChange(deps.store, uid, p, now());
       await deps.store.saveInbox(uid, pending);
-      await edit(`${GREETING}\n${savedText(p, await today(uid))}`);
-      log(`capture saved: ${p.kind}`);
-    } else {
-      await deps.store.saveInbox(uid, pending);
-      await edit(`${GREETING}\nOK, I didn't save it.`);
+      await edit(changeResultText(p, result, date));
+      log(`change ${p.kind}: ${result}`);
+      return;
+    }
+    if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
+    else await deps.store.createCard(uid, cardFor(p, now()));
+    await deps.store.saveInbox(uid, pending);
+    await edit(`${GREETING}\n${savedText(p, date)}`);
+    log(`capture saved: ${p.kind}`);
+  }
+
+  /** Offer proposals: several edit candidates share one message; anything else gets its own. */
+  async function offer(uid: string, chatId: string, items: (Proposal | Change)[], date: string, together: boolean) {
+    const pending = await livePending(uid);
+    const ids = items.map(() => proposalId());
+    items.forEach((item, i) => { pending[ids[i]] = { ...item, createdAt: now() }; });
+    await deps.store.saveInbox(uid, pending);
+    if (together && items.length > 1) {
+      const others = ids.join(',');
+      await send(chatId, changeQuestion(items as Change[], date), [
+        ...items.map((item, i) => [{ text: changeButtonLabel(item as Change), data: `save:${ids[i]}:${others}` }]),
+        [{ text: 'Cancel', data: `cancel:${others}` }],
+      ]);
+      return;
+    }
+    for (const [i, item] of items.entries()) {
+      const text = isChange(item) ? changeQuestion([item], date) : proposalText(item, date);
+      const yes = isChange(item) ? (item.kind === 'delete' ? 'Delete' : item.kind === 'complete' ? 'Mark done' : 'Update') : 'Save';
+      await send(chatId, text, [[{ text: yes, data: `save:${ids[i]}` }, { text: 'Cancel', data: `cancel:${ids[i]}` }]]);
     }
   }
+  let thinking = false;
 
   return async function handle(update: Update) {
     if (update.callback_query) { await confirm(update.callback_query); return; }
@@ -216,15 +276,47 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
       return;
     }
     const date = await today(uid);
+    const editCommand = parseEdit(message.text ?? '');
+    if (editCommand) {
+      const plan = planEdit(editCommand, await deps.store.cards(uid), date);
+      if (plan.error) { await send(chatId, `${GREETING}\n${escapeHtml(plan.error)}`); return; }
+      await offer(uid, chatId, plan.changes, date, true);
+      log(`change proposed: ${editCommand.name}`);
+      return;
+    }
     const captured = parseCapture(message.text ?? '', date);
-    if (!captured) { await send(chatId, `${GREETING}\nI didn't catch that. Try “remind me to … Friday”, “note: …”, a link, /check or /help.`); return; }
-    if ('error' in captured) { await send(chatId, `${GREETING}\n${escapeHtml(captured.error)}`); return; }
-    const pending = await livePending(uid);
-    const id = proposalId();
-    pending[id] = { ...captured, createdAt: now() };
-    await deps.store.saveInbox(uid, pending);
-    await send(chatId, proposalText(captured, date), [[{ text: 'Save', data: `save:${id}` }, { text: 'Cancel', data: `cancel:${id}` }]]);
-    log(`capture proposed: ${captured.kind}`);
+    if (captured && 'error' in captured) { await send(chatId, `${GREETING}\n${escapeHtml(captured.error)}`); return; }
+    if (captured) {
+      await offer(uid, chatId, [captured], date, false);
+      log(`capture proposed: ${captured.kind}`);
+      return;
+    }
+    // Anything else is a question for the owner's local model.
+    if (deps.mode === 'cloud') {
+      await send(chatId, `${GREETING}\nI answer questions with the AI on your PC, which is off or asleep right now. Ask again when it's on. Commands like /done, /move and “remind me…” still work.`);
+      return;
+    }
+    if (now() / 1000 - message.date > STALE_COMMAND_S) {
+      await send(chatId, `${GREETING}\nYou asked that while your PC was off. Ask again if you still want an answer.`);
+      return;
+    }
+    if (thinking) { await send(chatId, `${GREETING}\nI'm still working on your last question.`); return; }
+    thinking = true;
+    try {
+      await call('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => undefined);
+      const [settings, brain] = await Promise.all([deps.store.settings(uid), deps.store.brainSettings(uid)]);
+      const result = await answerQuestion(message.text ?? '', {
+        uid, today: date, timeZone: settingsFrom(settings).timezone, store: deps.store, calendars: deps.calendars?.[uid] ?? [],
+        ollama: { url: localOllamaUrl(brain?.ollamaUrl ?? DEFAULT_OLLAMA.url), model: brain?.ollamaModel || DEFAULT_OLLAMA.model },
+        fetcher: deps.fetcher, now,
+      });
+      await send(chatId, `${GREETING}\n${result.answer}`);
+      if (result.proposals.length) await offer(uid, chatId, result.proposals, date, false);
+      log(`question answered: ${result.toolCalls} tool calls, ${result.proposals.length} proposals`);
+    } catch {
+      await send(chatId, `${GREETING}\nI couldn't reach the AI on your PC. Check that Ollama is running, then ask again.`);
+      log('question failed');
+    } finally { thinking = false; }
   };
 }
 

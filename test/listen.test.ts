@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { drainOnce, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from '../src/run.ts';
+import type { CardDoc } from '../src/edit.ts';
 
 const UID = 'owner1', CHAT = '4242', TOKEN = 'T';
 const watch = (over: Partial<Watch> = {}): Watch => ({ id: 'w1', label: 'EX13 singles', url: 'https://shop.example/ex13', selector: '.item', ignore: '', interval: 5, enabled: true, createdAt: 1, runOn: 'local', ...over });
 
-function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
+const card = (over: Partial<CardDoc>): CardDoc => ({ id: 'c1', kind: 'reminder', title: 'File the brief', body: '', url: '', dueDate: '2027-01-15', done: false, pinned: false, tone: 'cream', createdAt: 1, updatedAt: 1, revision: 3, ...over });
+
+function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing: CardDoc[] = [], ollama?: (body: any) => unknown) {
   const states = new Map(Object.entries(seed)), items = new Map<string, ItemsDoc>();
   let inbox: Record<string, Pending> = {};
   const cards: NewCard[] = [], bookmarks: NewBookmark[] = [];
+  const myCards = existing.map(c => ({ ...c }));
   const store: Store & CaptureStore = {
     watches: async () => watches, states: async () => new Map(states), items: async () => new Map(items),
     save: async (_u, id, state, doc) => { states.set(id, state); if (doc) items.set(id, doc); },
@@ -16,9 +20,26 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
     settings: async () => ({ timezone: 'Asia/Singapore' }),
     inbox: async () => structuredClone(inbox), saveInbox: async (_u, pending) => { inbox = structuredClone(pending); },
     createCard: async (_u, card) => { cards.push(card); }, createBookmark: async (_u, bookmark) => { bookmarks.push(bookmark); },
+    brainSettings: async () => ({ ollamaUrl: 'http://evil.example:11434', ollamaModel: 'qwen3:14b' }),
+    unreadBookmarks: async () => [],
+    cards: async () => myCards.map(c => ({ ...c })),
+    updateCard: async (_u, id, revision, patch, now) => {
+      const c = myCards.find(x => x.id === id);
+      if (!c) return 'missing';
+      if (c.revision !== revision) return 'conflict';
+      Object.assign(c, patch, { updatedAt: now, revision: revision + 1 });
+      return 'ok';
+    },
+    deleteCard: async (_u, id, revision) => {
+      const i = myCards.findIndex(x => x.id === id);
+      if (i < 0) return 'missing';
+      if (myCards[i].revision !== revision) return 'conflict';
+      myCards.splice(i, 1);
+      return 'ok';
+    },
   };
   let clock = 1_800_000_000_000;
-  const sent: string[] = [], pages: string[] = [], edits: string[] = [], buttons: unknown[] = [];
+  const sent: string[] = [], pages: string[] = [], edits: string[] = [], buttons: unknown[] = [], toasts: string[] = [], ollamaUrls: string[] = [];
   let offsets: number[] = [];
   let pendingUpdates: Update[] = [];
   const fetcher = (async (input: string | URL, init?: RequestInit) => {
@@ -31,7 +52,13 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
       return new Response('{"ok":true}');
     }
     if (url.includes('/editMessageText')) { edits.push(JSON.parse(String(init?.body)).text); return new Response('{"ok":true}'); }
-    if (url.includes('/answerCallbackQuery')) return new Response('{"ok":true}');
+    if (url.includes('/answerCallbackQuery')) { const text = JSON.parse(String(init?.body)).text; if (text) toasts.push(text); return new Response('{"ok":true}'); }
+    if (url.includes('/sendChatAction')) return new Response('{"ok":true}');
+    if (url.includes('/api/chat')) {
+      ollamaUrls.push(url);
+      if (!ollama) return new Response('', { status: 500 });
+      return new Response(JSON.stringify(ollama(JSON.parse(String(init?.body)))));
+    }
     if (url.includes('/getUpdates')) {
       const offset = Number(new URL(url).searchParams.get('offset'));
       offsets.push(offset);
@@ -47,7 +74,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}) {
   const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
   const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
   const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
-  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, lastButtons, inbox: () => inbox,
+  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
     queue: (updates: Update[]) => { pendingUpdates = updates; }, offsets: () => offsets, advance: (ms: number) => { clock += ms; } };
 }
 
@@ -119,7 +146,7 @@ describe('commands', () => {
     await s.handle(s.message('/help'));
     await s.handle(s.message('what?'));
     expect(s.sent[0]).toContain('/check: check your PC watches now');
-    expect(s.sent[1]).toContain("I didn't catch that");
+    expect(s.sent[1]).toContain("I couldn't reach the AI on your PC"); // free text is a question now
   });
 });
 
@@ -149,7 +176,7 @@ describe('quick capture', () => {
     await s.handle(s.message('note: book the venue\nfor 40 people'));
     expect(s.sent.at(-1)).toBe('Doot Doot.\nSave this note to My Space?\n<b>Book the venue</b>\nfor 40 people');
     await s.handle(s.tap(s.lastButtons()[0][1].callback_data));
-    expect(s.edits.at(-1)).toContain("OK, I didn't save it.");
+    expect(s.edits.at(-1)).toContain('OK, I left it as it is.');
     await s.handle(s.message('https://example.com/article?id=1'));
     expect(s.sent.at(-1)).toContain('Add to your reading list?\n<b>example.com</b>');
     await s.handle(s.tap(s.lastButtons()[0][0].callback_data, 999)); // a stranger's tap
@@ -177,7 +204,7 @@ describe('quick capture', () => {
     await s.handle(s.message('remind me to'));
     expect(s.sent.at(-1)).toContain('What should I remind you about?');
     await s.handle(s.message('what is the weather'));
-    expect(s.sent.at(-1)).toContain("I didn't catch that");
+    expect(s.sent.at(-1)).toContain("I couldn't reach the AI on your PC");
   });
 
   it('in the cloud, answers messages, declines /check, and acknowledges what it handled', async () => {
@@ -192,6 +219,112 @@ describe('quick capture', () => {
     expect(s.sent[0]).toContain("Your PC is off or asleep, so I can't check its watches");
     expect(s.sent[1]).toContain('<b>Water plants</b>\nDue: today');
     expect(s.offsets()).toEqual([0, 43]); // the second call confirms both updates
+  });
+});
+
+describe('editing existing cards', () => {
+  it('/done asks first, then completes with the revision it saw', async () => {
+    const s = setup([], {}, [card({})]);
+    await s.handle(s.message('/done brief'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nMark this done?\n<b>File the brief</b>');
+    const [[yes, no]] = s.lastButtons();
+    expect([yes.text, no.text]).toEqual(['Mark done', 'Cancel']);
+    expect(s.myCards[0].done).toBe(false);
+    await s.handle(s.tap(yes.callback_data));
+    expect(s.myCards[0]).toMatchObject({ done: true, revision: 4 });
+    expect(s.edits.at(-1)).toContain('Done ✓ <b>File the brief</b> (moved to Archive)');
+  });
+
+  it('offers a choice when several cards match, and applies only the chosen one', async () => {
+    const s = setup([], {}, [card({ id: 'a', title: 'Pay rent' }), card({ id: 'b', title: 'Pay phone bill' }), card({ id: 'c', title: 'Pay tuition' })]);
+    await s.handle(s.message('/done pay'));
+    const rows = s.lastButtons();
+    expect(rows.map(r => r[0].text)).toEqual(['✓ Pay rent', '✓ Pay phone bill', '✓ Pay tuition', 'Cancel']);
+    expect(rows.every(r => r[0].callback_data.length <= 64)).toBe(true);
+    await s.handle(s.tap(rows[1][0].callback_data));
+    expect(s.myCards.filter(c => c.done).map(c => c.id)).toEqual(['b']);
+    // The other offers in that message are gone.
+    await s.handle(s.tap(rows[0][0].callback_data));
+    expect(s.myCards.filter(c => c.done).map(c => c.id)).toEqual(['b']);
+  });
+
+  it('never overwrites a newer edit made elsewhere', async () => {
+    const s = setup([], {}, [card({})]);
+    await s.handle(s.message('/move brief to Monday'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nMove this to Mon 18 Jan?\n<b>File the brief</b>');
+    s.myCards[0].revision = 9; // edited on another device meanwhile
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.myCards[0].dueDate).toBe('2027-01-15');
+    expect(s.edits.at(-1)).toContain('was changed somewhere else since I asked');
+  });
+
+  it('/move and /delete apply after confirmation; unclear requests explain', async () => {
+    const s = setup([], {}, [card({}), card({ id: 'n', kind: 'note', title: 'Old idea', dueDate: '' })]);
+    await s.handle(s.message('/move the brief to 20/1'));
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.myCards[0]).toMatchObject({ dueDate: '2027-01-20', revision: 4 });
+    expect(s.edits.at(-1)).toContain('Updated ✓ <b>File the brief</b>, due Wed 20 Jan');
+    await s.handle(s.message('/delete old idea'));
+    expect(s.sent.at(-1)).toContain('Delete this?');
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.myCards.map(c => c.id)).toEqual(['c1']);
+    await s.handle(s.message('/done nothing like this'));
+    expect(s.sent.at(-1)).toContain('No open reminder matches');
+    await s.handle(s.message('/move the brief'));
+    expect(s.sent.at(-1)).toContain('Which day?');
+  });
+
+  it('one-tap ✓ buttons complete straight away, still revision-checked', async () => {
+    const s = setup([], {}, [card({})]);
+    await s.handle(s.tap('done:c1:2')); // stale revision
+    expect(s.myCards[0].done).toBe(false);
+    expect(s.toasts.at(-1)).toContain('changed elsewhere');
+    await s.handle(s.tap('done:c1:3'));
+    expect(s.myCards[0].done).toBe(true);
+    expect(s.toasts.at(-1)).toBe('✓ File the brief is done');
+    await s.handle(s.tap('done:c1:3', 999)); // strangers are ignored
+    expect(s.toasts).toHaveLength(2);
+  });
+});
+
+describe('questions', () => {
+  it('answers from tools on the local model and offers changes as buttons', async () => {
+    const calls: any[] = [];
+    const s = setup([], {}, [card({}), card({ id: 'x', title: 'Exam', dueDate: '2027-01-20' })], body => {
+      calls.push(body);
+      if (calls.length === 1) return { message: { content: '', tool_calls: [{ function: { name: 'list_reminders', arguments: { when: 'this_week' } } }] } };
+      if (calls.length === 2) return { message: { content: '', tool_calls: [{ function: { name: 'propose_complete', arguments: { id: 'c1' } } }] } };
+      return { message: { content: 'Before your **Exam** on 20 Jan: <File the brief> is due today.' } };
+    });
+    await s.handle(s.message("what's due before my exam? also mark the brief done"));
+    // The model only ever runs on this machine, whatever the saved setting says.
+    expect(new Set(s.ollamaUrls)).toEqual(new Set(['http://localhost:11434/api/chat']));
+    expect(calls[0].model).toBe('qwen3:14b');
+    expect(calls[0].messages[0].content).toContain('Today is Friday 2027-01-15 (Asia/Singapore)');
+    const toolResult = JSON.parse(calls[1].messages.at(-1).content);
+    expect(toolResult.map((r: any) => r.title)).toEqual(['File the brief', 'Exam']);
+    expect(s.sent.find(t => t.includes('Before your'))).toBe('Doot Doot.\nBefore your <b>Exam</b> on 20 Jan: &lt;File the brief&gt; is due today.\n\nTap below to confirm.');
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nMark this done?\n<b>File the brief</b>');
+    expect(s.myCards[0].done).toBe(false); // nothing changes until the owner taps
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.myCards[0].done).toBe(true);
+  });
+
+  it('rejects made-up ids, and explains when the model is unreachable or the PC is off', async () => {
+    const s = setup([], {}, [card({})], body => body.messages.length < 3
+      ? { message: { tool_calls: [{ function: { name: 'propose_delete', arguments: '{"id":"invented"}' } }] } }
+      : { message: { content: 'I could not find that card.' } });
+    await s.handle(s.message('delete my tax note'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nI could not find that card.');
+    expect(s.inbox()).toEqual({});
+    const down = setup([], {}, []);
+    await down.handle(down.message('what is on tomorrow'));
+    expect(down.sent.at(-1)).toContain("I couldn't reach the AI on your PC");
+    const cloud = setup([], {}, []);
+    cloud.deps.mode = 'cloud';
+    await makeHandler(cloud.deps, makeQueue())(cloud.message('what is on tomorrow'));
+    expect(cloud.sent.at(-1)).toContain('the AI on your PC, which is off or asleep');
+    expect(cloud.ollamaUrls).toEqual([]);
   });
 });
 
