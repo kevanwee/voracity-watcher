@@ -1,0 +1,49 @@
+name: Watch sites
+
+on:
+  schedule:
+    # GitHub's minimum; runs often start a few minutes late.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Send a test message
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # only to keep this schedule enabled (see the last step)
+
+concurrency:
+  group: watch-sites
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --omit=dev --ignore-scripts
+      # Logs are public: the runner prints counts only, never addresses or content.
+      - run: npm run watch
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          WATCHER_OWNERS: ${{ secrets.WATCHER_OWNERS }}
+          WATCHER_TEST: ${{ inputs.test == true }}
+      # GitHub disables schedules in public repos after 60 days without commits.
+      # Re-enabling once a day keeps the watcher running.
+      - name: Keep the schedule enabled
+        if: always() && github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%H%M)" \< "0010" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/watch.yml/enable" --silent
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
