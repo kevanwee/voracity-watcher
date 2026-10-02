@@ -39,8 +39,9 @@ export function firestoreStore(serviceAccountJson: string | undefined): Store {
     async removeItems(uid, id) {
       await user(uid).collection('watchItems').doc(id).delete();
     },
-    async heartbeat(uid, at) {
-      await user(uid).collection('watcher').doc('status').set({ lastRunAt: at, version: VERSION });
+    async heartbeat(uid, at, runner) {
+      // Merge, so the cloud and local runners keep separate heartbeats.
+      await user(uid).collection('watcher').doc('status').set({ lastRunAt: at, version: VERSION, [`${runner}RunAt`]: at }, { merge: true });
     },
   };
 }

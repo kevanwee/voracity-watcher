@@ -46,8 +46,12 @@ export function recoveredMessage(label: string, url: string) {
   return [GREETING, `<b>${escapeHtml(label)}</b> is reachable again. Back to watching.`, link(url, 'Open the page')].join('\n');
 }
 
-export function testMessage(count: number) {
-  return `${GREETING}\nIca is connected to Voracity. ${count === 1 ? '1 site is' : `${count} sites are`} being watched.`;
+export function testMessage(count: number, runner: 'cloud' | 'local' = 'cloud') {
+  return `${GREETING}\nIca is connected to Voracity${runner === 'local' ? ' from your PC' : ''}. ${count === 1 ? '1 site is' : `${count} sites are`} being watched.`;
+}
+
+export function handoffMessage(label: string, url: string, status: number) {
+  return [GREETING, `<b>${escapeHtml(label)}</b> refuses GitHub's servers (HTTP ${status}), so your PC checks it from now on. GitHub won't contact this site again.`, link(url, 'Open the page')].join('\n');
 }
 
 /** Send one message. Telegram rate limits (429) are retried once after retry_after. */

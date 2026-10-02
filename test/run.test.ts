@@ -10,6 +10,7 @@ const html = (...items: string[]) => `<html><body>${items.map(item => `<div clas
 function memoryStore(watches: Watch[]) {
   const states = new Map<string, WatchState>(), items = new Map<string, ItemsDoc>();
   let heartbeat = 0;
+  const heartbeats: string[] = [];
   let itemWrites = 0;
   const store: Store = {
     watches: async () => watches,
@@ -17,9 +18,9 @@ function memoryStore(watches: Watch[]) {
     items: async () => new Map(items),
     save: async (_uid, id, state, doc) => { states.set(id, state); if (doc) { items.set(id, doc); itemWrites++; } },
     removeItems: async (_uid, id) => { items.delete(id); },
-    heartbeat: async (_uid, at) => { heartbeat = at; },
+    heartbeat: async (_uid, at, runner) => { heartbeat = at; heartbeats.push(runner); },
   };
-  return { store, states, items, heartbeatAt: () => heartbeat, itemWrites: () => itemWrites };
+  return { store, states, items, heartbeatAt: () => heartbeat, heartbeats, itemWrites: () => itemWrites };
 }
 
 /** A fake network and clock. Records requests with their (fake) time. */
@@ -43,7 +44,7 @@ function world(routes: Record<string, () => Response>) {
 const ok = (body: string, headers: Record<string, string> = {}) => () => new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', ...headers } });
 const robots = (body: string) => () => new Response(body, { status: 200, headers: { 'content-type': 'text/plain' } });
 
-async function run(env: ReturnType<typeof world>, store: Store, extra: { test?: boolean } = {}) {
+async function run(env: ReturnType<typeof world>, store: Store, extra: { test?: boolean; runner?: 'cloud' | 'local' } = {}) {
   const sent: string[] = [], logs: string[] = [];
   const totals = await runOnce({ owners: { [UID]: CHAT }, store, fetcher: env.fetcher, now: env.now, sleep: env.sleep, log: line => logs.push(line), send: async (chat, text) => { expect(chat).toBe(CHAT); sent.push(text); }, ...extra });
   return { sent, logs, totals };
@@ -132,24 +133,81 @@ describe('a watcher run', () => {
     expect(env.requests.filter(r => r.url.endsWith('ex13'))).toHaveLength(1); // still waiting
   });
 
-  it('alerts after two refusals, then once on recovery', async () => {
+  it('moves a watch to the local runner after two cloud refusals, and the cloud never contacts it again', async () => {
+    const memory = memoryStore([watch()]);
+    const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': () => new Response('', { status: 403 }) });
+    const page = () => env.requests.filter(r => r.url.endsWith('ex13')).length;
+    const first = await run(env, memory.store);
+    expect(first.sent).toEqual([]);
+    expect(memory.states.get('w1')).toMatchObject({ status: 'error', cloudRefusals: 1 });
+    expect(memory.states.get('w1')?.route).toBeUndefined();
+    env.advance(5 * 60_000);
+    const second = await run(env, memory.store);
+    expect(second.sent).toHaveLength(1);
+    expect(second.sent[0]).toMatch(/^Doot Doot\.\n<b>EX13<\/b> refuses GitHub's servers \(HTTP 403\), so your PC checks it from now on/);
+    expect(memory.states.get('w1')).toMatchObject({ route: 'local', cloudRefusals: 0, movedAt: env.now() });
+    expect(second.logs.at(-1)).toContain('moved 1');
+    // Weeks of cloud runs: no request to the site, no message.
+    for (let day = 0; day < 30; day++) {
+      env.advance(86_400_000);
+      expect((await run(env, memory.store)).sent).toEqual([]);
+    }
+    expect(page()).toBe(2);
+    expect(memory.heartbeats.every(runner => runner === 'cloud')).toBe(true);
+  });
+
+  it('the local runner checks only moved watches, alerts on its own refusals and announces recovery once', async () => {
+    const watches = [watch(), watch({ id: 'w2', url: 'https://other.example/news' })];
+    const memory = memoryStore(watches);
+    memory.states.set('w1', { status: 'error', checkedAt: 0, failures: 0, alerted: false, route: 'local', movedAt: 0 }); // as written by the hand-off
+    let status = 403;
+    const env = world({
+      'https://shop.example/robots.txt': robots(''), 'https://other.example/robots.txt': robots(''),
+      'https://shop.example/sell/ex13': () => status === 200 ? ok(html('a'))() : new Response('', { status }),
+      'https://other.example/news': ok(html('n')),
+    });
+    await run(env, memory.store, { runner: 'local' });
+    expect(env.requests.map(r => r.url)).not.toContain('https://other.example/news');
+    expect(memory.states.get('w1')).toMatchObject({ route: 'local', failures: 1 });
+    env.advance(memory.states.get('w1')!.retryAt! - env.now());
+    const second = await run(env, memory.store, { runner: 'local' });
+    expect(second.sent.join()).toContain('refused access (HTTP 403)');
+    expect(memory.states.get('w1')?.route).toBe('local');
+    status = 200;
+    env.advance(memory.states.get('w1')!.retryAt! - env.now());
+    const third = await run(env, memory.store, { runner: 'local' });
+    expect(third.sent.filter(text => text.includes('reachable again'))).toHaveLength(1);
+    expect(memory.states.get('w1')).toMatchObject({ status: 'ok', alerted: false, route: 'local' });
+    expect(memory.heartbeats).toEqual(['local', 'local', 'local']);
+    // The cloud runner handles only the other watch.
+    env.requests.length = 0;
+    await run(env, memory.store);
+    expect(env.requests.map(r => r.url)).toEqual(['https://other.example/robots.txt', 'https://other.example/news']);
+    expect((await run(env, memory.store, { runner: 'local', test: true })).sent[0]).toBe('Doot Doot.\nIca is connected to Voracity from your PC. 2 sites are being watched.');
+  });
+
+  it("watches set to 'Only my PC' are never fetched by the cloud runner", async () => {
+    const memory = memoryStore([watch({ runOn: 'local' })]);
+    const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': ok(html('a')) });
+    await run(env, memory.store);
+    expect(env.requests).toEqual([]);
+    const local = await run(env, memory.store, { runner: 'local' });
+    expect(local.sent[0]).toContain('Now watching');
+    expect(env.requests.map(r => r.url)).toEqual(['https://shop.example/robots.txt', 'https://shop.example/sell/ex13']);
+  });
+
+  it('a successful cloud check clears an earlier single refusal', async () => {
     const memory = memoryStore([watch()]);
     let status = 403;
     const env = world({ 'https://shop.example/robots.txt': robots(''), 'https://shop.example/sell/ex13': () => status === 200 ? ok(html('a'))() : new Response('', { status }) });
     await run(env, memory.store);
-    expect(memory.states.get('w1')?.failures).toBe(1);
-    env.advance(memory.states.get('w1')!.retryAt! - env.now());
-    const second = await run(env, memory.store);
-    expect(second.sent.join()).toContain('refused access (HTTP 403)');
-    status = 200;
-    env.advance(memory.states.get('w1')!.retryAt! - env.now());
-    const third = await run(env, memory.store);
-    expect(third.sent.filter(text => text.includes('reachable again'))).toHaveLength(1);
-    expect(third.sent.some(text => text.includes('Now watching'))).toBe(true);
-    expect(memory.states.get('w1')).toMatchObject({ status: 'ok', alerted: false });
-    // A third refusal does not alert again until two more have happened.
+    status = 200; env.advance(5 * 60_000);
+    await run(env, memory.store);
+    expect(memory.states.get('w1')).toMatchObject({ status: 'ok', cloudRefusals: 0 });
     status = 403; env.advance(5 * 60_000);
-    expect((await run(env, memory.store)).sent).toEqual([]);
+    await run(env, memory.store);
+    expect(memory.states.get('w1')).toMatchObject({ cloudRefusals: 1 });
+    expect(memory.states.get('w1')?.route).toBeUndefined();
   });
 
   it('keeps the old snapshot when Telegram fails, so the change is reported next time', async () => {

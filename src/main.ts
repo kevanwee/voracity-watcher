@@ -34,6 +34,7 @@ try {
     store: firestoreStore(serviceAccount()),
     send: (chatId, text) => sendTelegram(token, chatId, text),
     test: process.env.WATCHER_TEST === 'true',
+    runner: process.env.WATCHER_RUNNER === 'local' ? 'local' : 'cloud',
     log: line => console.log(line),
   });
 } catch (error) {
