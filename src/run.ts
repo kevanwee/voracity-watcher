@@ -41,6 +41,11 @@ export interface Deps {
   test?: boolean;
   /** 'cloud' for GitHub Actions (the default), 'local' for the owner's computer. */
   runner?: Runner;
+  /**
+   * A check the owner asked for (Telegram /check): ignores each watch's interval but
+   * still honours backoff, Retry-After and a one-minute per-watch cooldown.
+   */
+  manual?: { uid: string; match?: (watch: Watch) => boolean };
   /** Stop starting new checks after this long, so runs never overlap the next schedule. */
   budgetMs?: number;
 }
@@ -51,6 +56,11 @@ export const MAX_PER_OWNER = 30;
 const DAY = 86_400_000;
 /** Cloud refusals in a row before a watch moves to the local runner. */
 export const HANDOFF_AFTER = 2;
+/** A watch can be checked on request at most this often. */
+export const MANUAL_COOLDOWN_MS = 60_000;
+
+export type OutcomeKind = 'changed' | 'unchanged' | 'baseline' | 'failed' | 'moved' | 'waiting';
+export interface Outcome { label: string; kind: OutcomeKind; detail: string }
 
 export const routeOf = (state: WatchState | undefined, watch?: Watch): Runner => (watch?.runOn === 'local' ? 'local' : state?.route ?? 'cloud');
 
@@ -64,6 +74,21 @@ export function selectDue(watches: Watch[], states: Map<string, WatchState>, run
     .filter(watch => routeOf(states.get(watch.id), watch) === runner && isDue(watch, states.get(watch.id), now))
     .sort((a, b) => (states.get(a.id)?.checkedAt ?? 0) - (states.get(b.id)?.checkedAt ?? 0));
 }
+
+/** Watches a requested check covers, and the ones it must leave alone (with why). */
+export function selectManual(watches: Watch[], states: Map<string, WatchState>, runner: Runner, now: number, match: (watch: Watch) => boolean = () => true) {
+  const due: Watch[] = [], waiting: Outcome[] = [];
+  for (const watch of watches.slice(0, MAX_PER_OWNER)) {
+    const state = states.get(watch.id);
+    if (!watch.enabled || !match(watch) || routeOf(state, watch) !== runner) continue;
+    if (state?.retryAt && now < state.retryAt) waiting.push({ label: watch.label, kind: 'waiting', detail: `backing off until ${clock(state.retryAt)} (${state.error ?? 'earlier failure'})` });
+    else if (state && now - state.checkedAt < MANUAL_COOLDOWN_MS) waiting.push({ label: watch.label, kind: 'waiting', detail: 'checked less than a minute ago' });
+    else due.push(watch);
+  }
+  return { due, waiting };
+}
+
+const clock = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: process.env.TZ || 'Asia/Singapore' });
 // Scheduled runs start late; treat a watch as due slightly early so a 5-minute watch is not skipped every other run.
 const GRACE_MS = 90_000;
 
@@ -95,7 +120,8 @@ export async function runOnce(deps: Deps) {
   const robots = new Map<string, Promise<RobotsPolicy>>();
   const lastRequest = new Map<string, number>();
   const perHost = new Map<string, number>();
-  const totals = { due: 0, checked: 0, changed: 0, failed: 0, postponed: 0, moved: 0, notified: 0, sendFailures: 0 };
+  const totals = { due: 0, checked: 0, changed: 0, failed: 0, postponed: 0, moved: 0, notified: 0, sendFailures: 0, outcomes: [] as Outcome[] };
+  const record = (watch: Watch, kind: OutcomeKind, detail: string) => { totals.outcomes.push({ label: watch.label, kind, detail }); };
 
   async function politely<T>(host: string, spacing: number, request: () => Promise<T>) {
     const wait = (lastRequest.get(host) ?? -Infinity) + spacing - now();
@@ -109,6 +135,7 @@ export async function runOnce(deps: Deps) {
   }
 
   for (const [ownerIndex, [uid, chatId]] of Object.entries(deps.owners).entries()) {
+    if (deps.manual && deps.manual.uid !== uid) continue;
     const notify = async (text: string) => {
       try { await deps.send(chatId, text); totals.notified++; return true; } catch { totals.sendFailures++; return false; }
     };
@@ -117,21 +144,27 @@ export async function runOnce(deps: Deps) {
     for (const id of itemDocs.keys()) if (!known.has(id)) await deps.store.removeItems(uid, id);
     if (deps.test) await notify(testMessage(watches.filter(watch => watch.enabled).length, runner));
 
-    const due = selectDue(watches, states, runner, now());
+    let due: Watch[];
+    if (deps.manual) {
+      const picked = selectManual(watches, states, runner, now(), deps.manual.match);
+      due = picked.due;
+      totals.outcomes.push(...picked.waiting);
+    } else due = selectDue(watches, states, runner, now());
     totals.due += due.length;
 
     for (const watch of due) {
-      if (now() - started > budget) { totals.postponed++; continue; }
+      if (now() - started > budget) { totals.postponed++; record(watch, 'waiting', 'postponed to the next run'); continue; }
       let url: URL, host: string;
       try { url = new URL(watch.url); host = hostOf(watch.url); } catch { continue; }
       const previousState = states.get(watch.id), previous = itemDocs.get(watch.id);
       const sameSettings = previous && previous.url === watch.url && previous.selector === watch.selector && previous.ignore === watch.ignore;
       const policy = await policyFor(url);
       const { spacing, perRun } = hostLimits(policy);
-      if ((perHost.get(host) ?? 0) >= perRun) { totals.postponed++; continue; }
+      if ((perHost.get(host) ?? 0) >= perRun) { totals.postponed++; record(watch, 'waiting', "postponed: the site's request limit for this run is used up"); continue; }
 
       const fail = async (problem: string, notifyAfter: number, retryAfterMs = 0) => {
         totals.failed++;
+        record(watch, 'failed', problem);
         const failures = (previousState?.status === 'error' ? previousState.failures ?? 1 : 0) + 1;
         let alerted = previousState?.alerted ?? false;
         if (failures >= notifyAfter && !alerted) alerted = await notify(problemMessage(watch.label, watch.url, problem));
@@ -151,11 +184,13 @@ export async function runOnce(deps: Deps) {
         const refusals = (previousState?.cloudRefusals ?? 0) + 1;
         if (refusals >= HANDOFF_AFTER) {
           totals.moved++;
+          record(watch, 'moved', "the site refuses GitHub's servers; your PC checks it now");
           await notify(handoffMessage(watch.label, watch.url, result.status));
           await deps.store.save(uid, watch.id, { ...carry(previousState), status: 'error', checkedAt: now(), failures: 0, alerted: false,
             error: `the site refuses GitHub's servers (HTTP ${result.status}); your PC checks it now`, route: 'local', cloudRefusals: 0, movedAt: now() });
         } else {
           totals.failed++;
+          record(watch, 'failed', `the site refused access (HTTP ${result.status})`);
           await deps.store.save(uid, watch.id, { ...carry(previousState), status: 'error', checkedAt: now(), error: `the site refused access (HTTP ${result.status})`,
             failures: (previousState?.failures ?? 0) + 1, alerted: previousState?.alerted, cloudRefusals: refusals });
         }
@@ -167,6 +202,7 @@ export async function runOnce(deps: Deps) {
       // An unsent recovery notice is retried on the next successful check.
       const alerted = previousState?.alerted ? !(await notify(recoveredMessage(watch.label, watch.url))) : false;
       if (result.kind === 'unchanged' && previous) {
+        record(watch, 'unchanged', `no change (${count(previous.items.length)})`);
         await deps.store.save(uid, watch.id, { ...carry(previousState), status: 'ok', checkedAt: now(), itemCount: previous.items.length, failures: 0, alerted, ...(runner === 'cloud' ? { cloudRefusals: 0 } : {}) });
         continue;
       }
@@ -179,18 +215,21 @@ export async function runOnce(deps: Deps) {
       const base = { ...carry(previousState), status: 'ok' as const, checkedAt: now(), itemCount: items.length, failures: 0, alerted, ...(runner === 'cloud' ? { cloudRefusals: 0 } : {}) };
       if (!sameSettings) {
         // First check, or the address/selector changed: record a fresh baseline.
+        record(watch, 'baseline', `now watching (${count(items.length)})`);
         await notify(baselineMessage(watch.label, watch.url, items.length, watch.selector));
         await deps.store.save(uid, watch.id, base, next);
         continue;
       }
       const diff = diffItems(previous.items, items);
       if (isEmptyDiff(diff)) {
+        record(watch, 'unchanged', `no change (${count(items.length)})`);
         // Rewrite the snapshot only when its validators changed, to stay well inside Firestore's free write quota.
         const validators = previous.etag !== next.etag || previous.lastModified !== next.lastModified;
         await deps.store.save(uid, watch.id, base, validators ? next : undefined);
         continue;
       }
       totals.changed++;
+      record(watch, 'changed', summarise(diff));
       // Keep the old snapshot if Telegram is unreachable, so the change is reported next run.
       if (await notify(changeMessage(watch.label, watch.url, diff))) {
         await deps.store.save(uid, watch.id, { ...base, changedAt: now(), summary: summarise(diff) }, next);
@@ -205,6 +244,8 @@ export async function runOnce(deps: Deps) {
   log(`${runner} runner: due ${totals.due}, checked ${totals.checked}, changed ${totals.changed}, failed ${totals.failed}, postponed ${totals.postponed}, moved ${totals.moved}, messages ${totals.notified}, message failures ${totals.sendFailures}`);
   return totals;
 }
+
+const count = (n: number) => `${n} ${n === 1 ? 'item' : 'items'}`;
 
 /** Keep the last change details and routing across checks. */
 function carry(state?: WatchState): Partial<WatchState> {
