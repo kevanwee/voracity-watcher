@@ -86,16 +86,32 @@ export function checkReply(outcomes: Outcome[], cloudLabels: string[], filter: s
   return lines.join('\n');
 }
 
+function watchLine(watch: Watch, state: WatchState | undefined, now: number) {
+  const where = routeOf(state, watch) === 'local' ? 'your PC' : 'GitHub';
+  const last = !state ? 'not checked yet'
+    : state.status === 'error' ? `check failed ${ago(state.checkedAt, now)}: ${state.error ?? 'unknown error'}`
+    : `checked ${ago(state.checkedAt, now)}, ${state.itemCount ?? 0} items${state.changedAt ? `; changed ${ago(state.changedAt, now)}${state.summary ? ` (${state.summary})` : ''}` : ''}`;
+  return `• <b>${escapeHtml(watch.label)}</b>${watch.enabled ? '' : ' (paused)'}, from ${where}: ${escapeHtml(last)}`;
+}
+
 export function statusReply(watches: Watch[], states: Map<string, WatchState>, now: number) {
   if (!watches.length) return `${GREETING}\nNo watches yet. Add one in Voracity's Site watcher.`;
-  return [GREETING, ...watches.map(watch => {
-    const state = states.get(watch.id);
-    const where = routeOf(state, watch) === 'local' ? 'your PC' : 'GitHub';
-    const last = !state ? 'not checked yet'
-      : state.status === 'error' ? `check failed ${ago(state.checkedAt, now)}: ${state.error ?? 'unknown error'}`
-      : `checked ${ago(state.checkedAt, now)}, ${state.itemCount ?? 0} items${state.changedAt ? `; changed ${ago(state.changedAt, now)}${state.summary ? ` (${state.summary})` : ''}` : ''}`;
-    return `• <b>${escapeHtml(watch.label)}</b>${watch.enabled ? '' : ' (paused)'}, from ${where}: ${escapeHtml(last)}`;
-  })].join('\n');
+  return [GREETING, ...watches.map(watch => watchLine(watch, states.get(watch.id), now))].join('\n');
+}
+
+/**
+ * /check while the PC is away. The cloud run checks its own watches just before it reads
+ * messages, so their results are seconds old; fetching again would only hit the sites twice.
+ * Watches on the PC wait for it.
+ */
+export function cloudCheckReply(watches: Watch[], states: Map<string, WatchState>, now: number, filter: string) {
+  const lines = [GREETING];
+  const cloud = watches.filter(watch => routeOf(states.get(watch.id), watch) === 'cloud');
+  const pc = watches.filter(watch => routeOf(states.get(watch.id), watch) === 'local');
+  if (!watches.length) lines.push(filter ? `No active watch matches “${escapeHtml(filter)}”.` : 'You have no active watches.');
+  if (cloud.length) lines.push('GitHub just checked these:', ...cloud.map(watch => watchLine(watch, states.get(watch.id), now)));
+  if (pc.length) lines.push(`${cloud.length ? '\n' : ''}Your PC is off or asleep, so ${pc.map(watch => `<b>${escapeHtml(watch.label)}</b>`).join(', ')} ${pc.length === 1 ? 'waits' : 'wait'} until it's back.`);
+  return lines.join('\n');
 }
 
 export function proposalText(p: Proposal, today: string) {
@@ -257,15 +273,16 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
         await send(chatId, `${GREETING}\nYour PC was off when you sent that, so I didn't run it late. Send it again if you still want it.`);
         return;
       }
+      const filter = command.filter.toLowerCase();
+      const match = (watch: Watch) => !filter || watch.label.toLowerCase().includes(filter);
       if (deps.mode === 'cloud') {
-        await send(chatId, `${GREETING}\nYour PC is off or asleep, so I can't check its watches right now. They resume when it's back; /status shows the latest.`);
+        const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
+        await send(chatId, cloudCheckReply(watches.filter(watch => watch.enabled && match(watch)), states, now(), command.filter));
         return;
       }
       if (checking) { await send(chatId, `${GREETING}\nI'm already checking. Results are on their way.`); return; }
       checking = true;
       try {
-        const filter = command.filter.toLowerCase();
-        const match = (watch: Watch) => !filter || watch.label.toLowerCase().includes(filter);
         await send(chatId, `${GREETING}\nChecking${filter ? ` “${escapeHtml(command.filter)}”` : ''} now…`);
         const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match } }));
         const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
