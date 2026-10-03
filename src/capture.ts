@@ -4,10 +4,11 @@
 export type Proposal =
   | { kind: 'reminder'; title: string; body: string; dueDate: string }
   | { kind: 'note'; title: string; body: string }
-  | { kind: 'bookmark'; url: string; title: string };
+  | { kind: 'bookmark'; url: string; title: string }
+  | { kind: 'parcel'; number: string; label: string };
 
 // Field limits match Voracity's model.ts / bookmarks.ts and firestore.rules.
-export const LIMITS = { title: 120, body: 10000, url: 2048, bookmarkTitle: 200 } as const;
+export const LIMITS = { title: 120, body: 10000, url: 2048, bookmarkTitle: 200, parcelLabel: 60 } as const;
 
 const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -100,6 +101,18 @@ const URL_RE = /\bhttps?:\/\/[^\s<>"]+/i;
 export function parseCapture(text: string, today: string): Proposal | { error: string } | null {
   const message = text.trim();
   let match: RegExpMatchArray | null;
+  // "track SPXSG0123… keyboard" or "/track …": the word after "track" must look like a
+  // tracking number, so "track my budget" is still a question.
+  if ((match = message.match(/^(\/track(?:@\w+)?|track)(?:\s+([\s\S]*))?$/i))) {
+    const explicit = match[1].startsWith('/');
+    const [first = '', ...words] = (match[2] ?? '').trim().split(/\s+/);
+    const number = first.replace(/[.]/g, '').toUpperCase();
+    if (/^[A-Z0-9-]{6,40}$/.test(number) && /\d/.test(number)) {
+      const label = capitalise(tidy(words.join(' '))).slice(0, LIMITS.parcelLabel) || `Parcel ending ${number.slice(-4)}`;
+      return { kind: 'parcel', number, label };
+    }
+    if (explicit) return { error: 'Send /track with the tracking number, then a name: “/track SPXSG012345678901 keyboard”.' };
+  }
   if ((match = message.match(/^(?:\/remind(?:@\w+)?|remind\s+me(?:\s+to)?|reminder\s*:)\s*([\s\S]*)$/i))) {
     // The date and title come from the first line; any further lines are the details.
     const [first, ...more] = match[1].replace(/^to\s+/i, '').split('\n');
