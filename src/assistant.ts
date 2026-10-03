@@ -45,6 +45,8 @@ export interface BriefingInput {
   changes: { label: string; summary: string; at: number }[]; unread: Bookmark[]; now: number;
   /** Today's calendar, already formatted ("09:00–10:30 Lecture (LT1)"). */
   events?: string[];
+  /** Parcels that need you or arrive today, already escaped ("Keyboard: out for delivery"). */
+  parcels?: string[];
 }
 
 /** One "✓" button per reminder (at most five), each a single-tap, revision-checked "done". */
@@ -63,6 +65,7 @@ export function briefingMessage(b: BriefingInput) {
   else lines.push('', 'Nothing due today.');
   if (b.overdue.length) lines.push('', '<b>Still open</b>', ...bullets(b.overdue.map(r => `${escapeHtml(r.title)} (was due ${formatDue(r.dueDate, b.today)})`)));
   if (b.tomorrow.length) lines.push('', '<b>Tomorrow</b>', ...bullets(b.tomorrow.map(r => escapeHtml(r.title))));
+  if (b.parcels?.length) lines.push('', '<b>Parcels</b>', ...bullets(b.parcels));
   if (b.changes.length) lines.push('', '<b>Watches</b>', ...bullets(b.changes.map(c => `${escapeHtml(c.label)}: ${escapeHtml(c.summary)} (${ago(c.at, b.now)})`)));
   if (b.unread.length) lines.push('', `<b>Reading list</b>: ${b.unread.length} unread`, ...bullets(b.unread.slice(0, 3).map(item => escapeHtml(item.title))).slice(0, 3));
   return lines.join('\n');
@@ -87,6 +90,8 @@ export interface AssistantDeps {
   send: (chatId: string, text: string, buttons?: Buttons) => Promise<void>;
   /** Today's events from the owner's private calendar feeds, if any are connected. */
   events?: (uid: string, today: string, timeZone: string) => Promise<string[]>;
+  /** Parcels for the briefing (briefingParcels), when parcel tracking is set up. */
+  parcels?: (uid: string, today: string) => Promise<string[]>;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -122,7 +127,8 @@ export async function runAssistant(deps: AssistantDeps) {
           return state?.changedAt && state.changedAt > since && state.summary ? [{ label: watch.label, summary: state.summary, at: state.changedAt }] : [];
         });
         const events = deps.events ? await deps.events(uid, today, settings.timezone).catch(() => []) : [];
-        sent = await send(briefingMessage({ today, dueToday, overdue, tomorrow, changes, unread: unread.sort((a, b) => b.createdAt - a.createdAt), now: now(), events }), doneButtons([...dueToday, ...overdue]));
+        const parcels = deps.parcels ? await deps.parcels(uid, today).catch(() => []) : [];
+        sent = await send(briefingMessage({ today, dueToday, overdue, tomorrow, changes, unread: unread.sort((a, b) => b.createdAt - a.createdAt), now: now(), events, parcels }), doneButtons([...dueToday, ...overdue]));
         if (sent) totals.briefings++;
       } else if (dueToday.length || overdue.length || tomorrow.length) {
         sent = await send(morningReminderMessage(today, dueToday, overdue, tomorrow), doneButtons([...dueToday, ...overdue]));

@@ -7,6 +7,7 @@ import { localClock, settingsFrom, type AssistantSettings, type Bookmark } from 
 import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
 import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
+import { parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
 export const SCHEDULE_MS = 5 * 60_000;
@@ -18,6 +19,8 @@ export const PROPOSAL_TTL_MS = 86_400_000;
 export const COMMANDS = [
   { command: 'check', description: 'Check your PC watches now (add a name to check one)' },
   { command: 'status', description: 'Show each watch and its last check' },
+  { command: 'track', description: 'Track a parcel, e.g. /track SPXSG012345678901 keyboard' },
+  { command: 'parcels', description: 'Show your parcels and where they are' },
   { command: 'remind', description: 'Add a reminder, e.g. /remind file the brief Friday' },
   { command: 'note', description: 'Add a note to My Space' },
   { command: 'save', description: 'Add a link to your reading list' },
@@ -33,7 +36,7 @@ export interface Update {
   callback_query?: { id: string; data?: string; message?: { message_id: number; chat: { id: number } } };
 }
 
-export type Command = { name: 'check'; filter: string } | { name: 'status' } | { name: 'help' } | null;
+export type Command = { name: 'check'; filter: string } | { name: 'status' } | { name: 'parcels' } | { name: 'help' } | null;
 
 /** Accepts "/check", "/check@SomeBot ex13", "check ex13", "status", "/help", "/start". */
 export function parseCommand(text: string | undefined): Command {
@@ -42,6 +45,7 @@ export function parseCommand(text: string | undefined): Command {
   const name = match[1].toLowerCase(), rest = (match[2] ?? '').trim();
   if (name === 'check') return { name: 'check', filter: rest };
   if (name === 'status' && !rest) return { name: 'status' };
+  if (name === 'parcels' && !rest) return { name: 'parcels' };
   if ((name === 'help' || name === 'start') && !rest) return { name: 'help' };
   return null;
 }
@@ -115,6 +119,7 @@ export function cloudCheckReply(watches: Watch[], states: Map<string, WatchState
 }
 
 export function proposalText(p: Proposal, today: string) {
+  if (p.kind === 'parcel') return `${GREETING}\nTrack this parcel?\n<b>${escapeHtml(p.label)}</b>\n<code>${escapeHtml(p.number)}</code>`;
   if (p.kind === 'bookmark') return `${GREETING}\nAdd to your reading list?\n<b>${escapeHtml(p.title)}</b>\n${escapeHtml(p.url)}`;
   const body = p.body ? `\n${escapeHtml(p.body.length > 200 ? p.body.slice(0, 199) + '…' : p.body)}` : '';
   if (p.kind === 'note') return `${GREETING}\nSave this note to My Space?\n<b>${escapeHtml(p.title)}</b>${body}`;
@@ -122,13 +127,14 @@ export function proposalText(p: Proposal, today: string) {
 }
 
 function savedText(p: Proposal, today: string) {
+  if (p.kind === 'parcel') return `Tracking ✓\n<b>${escapeHtml(p.label)}</b>. I'll message you when it moves.`;
   if (p.kind === 'bookmark') return `Added to your reading list ✓\n<b>${escapeHtml(p.title)}</b>`;
   if (p.kind === 'note') return `Saved to My Space ✓\n<b>${escapeHtml(p.title)}</b>`;
   return `Saved to My Space ✓\n<b>${escapeHtml(p.title)}</b>, due ${formatDue(p.dueDate, today)}`;
 }
 
 /** Card and bookmark documents exactly as Voracity creates them (model.ts, bookmarks.ts, firestore.rules). */
-export function cardFor(p: Exclude<Proposal, { kind: 'bookmark' }>, now: number) {
+export function cardFor(p: Extract<Proposal, { kind: 'reminder' | 'note' }>, now: number) {
   return { id: crypto.randomUUID(), kind: p.kind, title: p.title.slice(0, LIMITS.title), body: p.body.slice(0, LIMITS.body), url: '',
     dueDate: p.kind === 'reminder' ? p.dueDate : '', done: false, pinned: false, tone: 'cream', createdAt: now, updatedAt: now, revision: 0 };
 }
@@ -149,6 +155,9 @@ export interface CaptureStore extends EditStore {
   saveInbox(uid: string, pending: Record<string, Pending>): Promise<void>;
   createCard(uid: string, card: NewCard): Promise<void>;
   createBookmark(uid: string, bookmark: NewBookmark): Promise<void>;
+  parcels(uid: string): Promise<Parcel[]>;
+  parcelStates(uid: string): Promise<Map<string, ParcelState>>;
+  createParcel(uid: string, parcel: Parcel): Promise<void>;
 }
 
 export interface ListenDeps {
@@ -226,7 +235,16 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
       log(`change ${p.kind}: ${result}`);
       return;
     }
-    if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
+    if (p.kind === 'parcel') {
+      // Refuse a number that is already being tracked, as Voracity does.
+      if ((await deps.store.parcels(uid)).some(parcel => parcel.number === p.number && !parcel.archived)) {
+        await deps.store.saveInbox(uid, pending);
+        await edit(`${GREETING}\nYou're already tracking <code>${escapeHtml(p.number)}</code>. /parcels shows its status.`);
+        return;
+      }
+      await deps.store.createParcel(uid, parcelFor(p, now()));
+    }
+    else if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
     else await deps.store.createCard(uid, cardFor(p, now()));
     await deps.store.saveInbox(uid, pending);
     await edit(`${GREETING}\n${savedText(p, date)}`);
@@ -263,6 +281,11 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (!uid) return; // Only owners in WATCHER_OWNERS can talk to Ica; everyone else is ignored.
     const command = parseCommand(message.text);
     if (command?.name === 'help') { await send(chatId, helpReply()); return; }
+    if (command?.name === 'parcels') {
+      const [parcels, states] = await Promise.all([deps.store.parcels(uid), deps.store.parcelStates(uid)]);
+      await send(chatId, parcelsReply(parcels, states));
+      return;
+    }
     if (command?.name === 'status') {
       const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
       await send(chatId, statusReply(watches, states, now()));

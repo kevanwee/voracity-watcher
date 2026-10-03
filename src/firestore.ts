@@ -5,14 +5,16 @@ import { VERSION } from './fetch.ts';
 import type { CardDoc, WriteResult } from './edit.ts';
 import type { CaptureStore, NewBookmark, NewCard, Pending } from './listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from './run.ts';
+import type { Parcel, ParcelState, ParcelStore } from './parcels.ts';
 
 export interface RunnerStatus { lastRunAt?: number; cloudRunAt?: number; localRunAt?: number }
-export type FullStore = Store & AssistantStore & CaptureStore & { status(uid: string): Promise<RunnerStatus | null> };
+export type FullStore = Store & AssistantStore & CaptureStore & ParcelStore & { status(uid: string): Promise<RunnerStatus | null> };
 
 /**
  * Reads users/{uid}/watches, cards, bookmarks and settings/assistant; writes the
  * runner-only documents: watchState/{id}, watchItems/{id}, watcher/status and
- * assistant/{schedule,inbox}. Creates cards and bookmarks only after the owner taps Save.
+ * assistant/{schedule,inbox} and parcelState/{id}. Creates cards, bookmarks and parcels only
+ * after the owner taps Save.
  */
 export function firestoreStore(serviceAccountJson: string | undefined): FullStore {
   const emulator = !!process.env.FIRESTORE_EMULATOR_HOST;
@@ -93,6 +95,20 @@ export function firestoreStore(serviceAccountJson: string | undefined): FullStor
     async brainSettings(uid) {
       const snap = await user(uid).collection('settings').doc('brain').get();
       return snap.exists ? (snap.data() as { ollamaUrl?: string; ollamaModel?: string }) : null;
+    },
+    async parcels(uid) {
+      const snap = await user(uid).collection('parcels').get();
+      return snap.docs.map(doc => ({ ...doc.data(), id: doc.id }) as Parcel);
+    },
+    async parcelStates(uid) {
+      const snap = await user(uid).collection('parcelState').get();
+      return new Map(snap.docs.map(doc => [doc.id, doc.data() as ParcelState]));
+    },
+    async saveParcelState(uid, id, state) {
+      await user(uid).collection('parcelState').doc(id).set(state);
+    },
+    async createParcel(uid, parcel) {
+      await user(uid).collection('parcels').doc(parcel.id).create(parcel);
     },
     async cards(uid) {
       const snap = await user(uid).collection('cards').get();

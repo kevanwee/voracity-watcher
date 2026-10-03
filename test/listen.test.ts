@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { Parcel } from '../src/parcels.ts';
 import { drainOnce, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from '../src/run.ts';
 import type { CardDoc } from '../src/edit.ts';
@@ -11,12 +12,14 @@ const card = (over: Partial<CardDoc>): CardDoc => ({ id: 'c1', kind: 'reminder',
 function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing: CardDoc[] = [], ollama?: (body: any) => unknown) {
   const states = new Map(Object.entries(seed)), items = new Map<string, ItemsDoc>();
   let inbox: Record<string, Pending> = {};
-  const cards: NewCard[] = [], bookmarks: NewBookmark[] = [];
+  const cards: NewCard[] = [], bookmarks: NewBookmark[] = [], parcels: Parcel[] = [];
   const myCards = existing.map(c => ({ ...c }));
   const store: Store & CaptureStore = {
     watches: async () => watches, states: async () => new Map(states), items: async () => new Map(items),
     save: async (_u, id, state, doc) => { states.set(id, state); if (doc) items.set(id, doc); },
     removeItems: async () => {}, heartbeat: async () => {},
+    parcels: async () => parcels, parcelStates: async () => new Map([['p0', { registered: true, status: 'OutForDelivery' }]]),
+    createParcel: async (_u, parcel) => { parcels.push(parcel); },
     settings: async () => ({ timezone: 'Asia/Singapore' }),
     inbox: async () => structuredClone(inbox), saveInbox: async (_u, pending) => { inbox = structuredClone(pending); },
     createCard: async (_u, card) => { cards.push(card); }, createBookmark: async (_u, bookmark) => { bookmarks.push(bookmark); },
@@ -74,7 +77,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
   const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
   const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
-  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
+  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
     queue: (updates: Update[]) => { pendingUpdates = updates; }, offsets: () => offsets, advance: (ms: number) => { clock += ms; } };
 }
 
@@ -347,5 +350,39 @@ describe('queue and polling', () => {
     const next = await pollOnce({ token: TOKEN, owners: {}, store: {} as ListenDeps['store'], base: {}, fetcher }, 0, async update => { handled.push(update.update_id); }, 0);
     expect(next).toBe(10);
     expect(handled).toEqual([7, 9]);
+  });
+});
+
+describe('tracking parcels from Telegram', () => {
+  it('proposes a parcel from "track …", saves it as Voracity would, and refuses a repeat', async () => {
+    const s = setup([]);
+    await s.handle(s.message('track spxsg012345678901 keyboard from lazada'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\nTrack this parcel?\n<b>Keyboard from lazada</b>\n<code>SPXSG012345678901</code>');
+    expect(s.parcels).toEqual([]);
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.parcels).toHaveLength(1);
+    expect(s.parcels[0]).toMatchObject({ number: 'SPXSG012345678901', label: 'Keyboard from lazada', carrier: 0, archived: false, revision: 0 });
+    expect(Object.keys(s.parcels[0]).sort()).toEqual(['archived', 'carrier', 'createdAt', 'id', 'label', 'number', 'revision', 'updatedAt']);
+    expect(s.edits.at(-1)).toContain("Tracking ✓\n<b>Keyboard from lazada</b>. I'll message you when it moves.");
+
+    await s.handle(s.message('/track SPXSG012345678901'));
+    expect(s.sent.at(-1)).toContain('<b>Parcel ending 8901</b>');
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    expect(s.parcels).toHaveLength(1);
+    expect(s.edits.at(-1)).toContain("You're already tracking <code>SPXSG012345678901</code>");
+  });
+
+  it('keeps "track my …" as a question, explains a bare /track, and lists parcels', async () => {
+    const s = setup([]);
+    await s.handle(s.message('/track'));
+    expect(s.sent.at(-1)).toContain('Send /track with the tracking number');
+    await s.handle(s.message('track my budget this month'));
+    expect(s.sent.at(-1)).toContain("I couldn't reach the AI on your PC"); // treated as a question
+    await s.handle(s.message('track EB123456789SG textbooks'));
+    await s.handle(s.tap(s.lastButtons()[0][0].callback_data));
+    s.parcels[0].id = 'p0';
+    await s.handle(s.message('/parcels'));
+    expect(s.sent.at(-1)).toBe('Doot Doot.\n• <b>Textbooks</b>: Out for delivery');
+    expect(parseCommand('/parcels')).toEqual({ name: 'parcels' });
   });
 });
