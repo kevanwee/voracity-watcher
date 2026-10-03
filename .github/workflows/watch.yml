@@ -2,8 +2,10 @@ name: Watch sites
 
 on:
   schedule:
-    # GitHub's minimum; runs often start a few minutes late.
+    # Best-effort fallback only: GitHub ran this every 4-6 hours in practice. The Apps
+    # Script wake-up timer (scripts/apps-script/wake.gs) requests a run every 5 minutes.
     - cron: "*/5 * * * *"
+  # Requested runs start within seconds: the wake-up timer and "Run workflow" use this.
   workflow_dispatch:
     inputs:
       test:
