@@ -255,6 +255,7 @@ Firebase project.
    | `TELEGRAM_BOT_TOKEN` | The token from BotFather |
    | `FIREBASE_SERVICE_ACCOUNT` | The whole JSON key file |
    | `WATCHER_OWNERS` | `{"<notes account UID>": "<chat ID>"}`. Voracity's Site watcher setup shows this with your UID filled in |
+| `TRACK17_API_KEY` | Optional: your 17TRACK API key, for [parcels](#parcels) |
 
    With the GitHub CLI, set them from files so they never appear in your shell history:
 
@@ -267,6 +268,43 @@ Firebase project.
    Delete the local key file afterwards.
 5. **Test.** Actions → *Watch sites* → *Run workflow*, ticking *Send a test message*. Ica
    should reply "Doot Doot. Ica is connected to Voracity."
+
+## Parcels
+
+Track deliveries from Voracity's **Parcels** card, or send Ica
+`track <number> <name>`. Examples: `track SPXSG012345678901 keyboard`, or `/track` with
+the number and then the name.
+
+- **Carrier detection is automatic.** [17TRACK](https://api.17track.net) recognises
+  SingPost, Shopee Express, Ninja Van, J&T, Qxpress, DHL, UPS, FedEx and about 2,900
+  others.
+- **Each cloud run:**
+  - registers new numbers once (the only step that uses 17TRACK quota);
+  - reads the status of parcels due a check: every 30 minutes, or daily once
+    delivered. Reading status is free;
+  - saves the status to `parcelState/{id}` for Voracity to show.
+- **Ica messages you once per change**, when the status or latest event changes:
+  "📦 Now tracking …", "📦 Keyboard: out for delivery.", "📦 Keyboard was delivered ✓".
+  - "Waiting for the carrier" with nothing to show stays quiet.
+  - If Telegram is down, the change is reported on the next run.
+- **The morning briefing** has a **Parcels** section for anything out for delivery,
+  ready to collect, failed or due today.
+- **`/parcels`** lists everything being tracked.
+- **Stopping:** archive or delete a parcel in Voracity and the runner stops checking it.
+  17TRACK stops by itself after 30 days without updates.
+
+**Setup:** create a free account at [17TRACK's API](https://api.17track.net/en), copy
+the API key from the dashboard, and add it as the `TRACK17_API_KEY` Actions secret:
+
+```bash
+gh secret set TRACK17_API_KEY < track17-key.txt
+```
+
+Until it's set, each parcel says Ica isn't set up yet.
+- **Allowance:** new 17TRACK accounts get 200 free tracking numbers, once. Ica uses one
+  per parcel, and a refused number (not found yet, or invalid) uses none. It's retried
+  every 6 hours.
+- **When it runs out,** existing parcels keep updating, and new ones say so.
 
 ## Data
 
@@ -284,6 +322,8 @@ these paths for each owner listed in `WATCHER_OWNERS`:
 | `users/{uid}/assistant/schedule`, `inbox` | read/write | Which mornings and reminders were sent; unconfirmed proposals. Not readable by browsers |
 | `users/{uid}/cards/{id}` | update / delete on confirm | Done, due date, title, or deletion, only if the revision is unchanged |
 | `users/{uid}/settings/brain` | read (PC only) | Which local Ollama model answers questions |
+| `users/{uid}/parcels/{id}` | read; create on Save | Parcels written by Voracity, or by Ica after you tap Save on a `track` proposal |
+| `users/{uid}/parcelState/{id}` | write | Tracking status from 17TRACK: status, carrier, latest and recent events, estimate |
 
 Alerts for an owner go only to that owner's chat. If Telegram is unreachable, the old
 snapshot is kept, so the change is reported on a later run.
