@@ -28,7 +28,8 @@ unlimited Actions minutes, and no addresses or personal data are published.
 flowchart LR
     owner(["👤 Owner"]) -->|adds watches| voracity["Voracity<br/>Site watcher panel"]
     voracity -->|"users/{uid}/watches"| fs[("Cloud Firestore")]
-    cron["GitHub Actions<br/>every 5 min"] --> runner["Cloud runner<br/>(this repo)"]
+    wake["Google Apps Script<br/>every 5 min"] -->|"workflow_dispatch"| cron["GitHub Actions"]
+    cron --> runner["Cloud runner<br/>(this repo)"]
     task["Task Scheduler<br/>every 5 min"] --> local["Local runner<br/>(same code, your PC)"]
     runner & local -->|"read watches,<br/>write watchState"| fs
     runner -->|"robots.txt, then page<br/>(identified, spaced)"| sites["Watched sites"]
@@ -157,9 +158,11 @@ saved until you tap Save.
 - **Saved items match the app:** cards and bookmarks are written exactly as Voracity
   writes them, so they sync to every device straight away.
 
-**When your PC is off,** the cloud runner picks up waiting messages on its next run
-(within about 5–15 minutes), so capture still works from your phone. `/check` then
-explains that the PC watches will resume when the PC is back.
+**When your PC is off,** the cloud runner picks up waiting messages on its next run, so
+capture, edits and `/status` still work from your phone. With the
+[wake-up timer](#keep-ica-awake) that is within about 5 minutes. `/check` then reports
+the watches GitHub just checked and names the PC watches that wait for it. Only
+questions need the PC, because they use the AI on it.
 
 ## Changing things
 
@@ -267,6 +270,37 @@ Firebase project.
    Delete the local key file afterwards.
 5. **Test.** Actions → *Watch sites* → *Run workflow*, ticking *Send a test message*. Ica
    should reply "Doot Doot. Ica is connected to Voracity."
+6. **Keep Ica awake** (strongly recommended): see below.
+
+### Keep Ica awake
+
+GitHub runs scheduled workflows in free repositories on a best-effort basis. In practice
+this repository's "every 5 minutes" schedule ran only every 4 to 6 hours, so while the
+PC was off Ica answered hours late and briefings arrived late. A run that is *requested*
+starts within seconds, so a small Google Apps Script requests one every 5 minutes. It is
+free and runs under your own Google account.
+
+1. Create a **fine-grained token** at
+   [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new):
+   - Repository access: *Only select repositories* → this repository.
+   - Repository permissions: **Actions → Read and write**. Nothing else.
+   - It can start or cancel this repository's workflows, but it can't read the secrets
+     or change the code.
+2. Open [script.google.com](https://script.google.com) → *New project*, and paste
+   [`scripts/apps-script/wake.gs`](scripts/apps-script/wake.gs).
+3. *Project Settings* → *Script properties* → add `GITHUB_TOKEN` with the token. If your
+   fork has another name, also add `WATCHER_REPO` (`owner/name`).
+4. Back in the editor, pick **install** and press *Run*, then allow the permissions it
+   asks for (an external request, and running on a schedule).
+
+Voracity's Ica badge turns active within 5 minutes. To stop, run **uninstall**, or delete
+the token on GitHub. GitHub's own schedule stays on as a fallback.
+
+The cost stays at zero:
+- Each run takes about 20 seconds, and Actions minutes are free for public repositories.
+- The script uses about 3 of Apps Script's 90 free minutes a day.
+- With a few watches, each run reads about 13 Firestore documents and writes about 4:
+  roughly 3,700 reads and 1,200 writes a day, against free limits of 50,000 and 20,000.
 
 ## Data
 
@@ -296,7 +330,9 @@ messages are reduced to fixed text or error codes.
 
 ## Limits
 
-- GitHub runs schedules every 5 minutes at best, and often starts them 5–15 minutes late.
+- GitHub's own schedule is best-effort (it ran every 4–6 hours here). The Apps Script
+  [wake-up timer](#keep-ica-awake) makes it every 5 minutes. If the timer stops, runs fall
+  back to GitHub's schedule.
 - Watches on your PC pause while it is off or asleep. Missed checks run when it wakes.
 - A watch that moved to your PC stays there. To try the cloud again, delete it and add it again.
 - GitHub disables schedules in public repositories after 60 days without commits. The

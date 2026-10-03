@@ -207,16 +207,19 @@ describe('quick capture', () => {
     expect(s.sent.at(-1)).toContain("I couldn't reach the AI on your PC");
   });
 
-  it('in the cloud, answers messages, declines /check, and acknowledges what it handled', async () => {
-    const s = setup([watch()]);
+  it('in the cloud, answers messages, reports /check from this run, and acknowledges what it handled', async () => {
+    const s = setup([watch(), watch({ id: 'w2', label: 'Card shop', url: 'https://cards.example/', runOn: 'auto' })],
+      { w2: { checkedAt: 1_800_000_000_000 - 20_000, status: 'ok', itemCount: 12 } as WatchState });
     const now = Math.floor(1_800_000_000_000 / 1000);
     s.queue([
       { update_id: 41, message: { date: now, text: '/check', chat: { id: Number(CHAT) } } },
       { update_id: 42, message: { date: now, text: 'remind me to water plants today', chat: { id: Number(CHAT) } } },
     ]);
     await drainOnce(s.deps);
-    expect(s.pages).toEqual([]);
-    expect(s.sent[0]).toContain("Your PC is off or asleep, so I can't check its watches");
+    expect(s.pages).toEqual([]); // nothing is fetched again: the run just checked GitHub's watches
+    expect(s.sent[0]).toContain('GitHub just checked these:\n• <b>Card shop</b>, from GitHub: checked');
+    expect(s.sent[0]).toContain('12 items');
+    expect(s.sent[0]).toContain("Your PC is off or asleep, so <b>EX13 singles</b> waits until it's back.");
     expect(s.sent[1]).toContain('<b>Water plants</b>\nDue: today');
     expect(s.offsets()).toEqual([0, 43]); // the second call confirms both updates
   });
