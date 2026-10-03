@@ -78,8 +78,10 @@ describe('morning briefing', () => {
       unreadBookmarks: async () => [],
     };
     await runAssistant({ owners: { [UID]: CHAT }, store, now: () => at('08:00'), send: async (_c, text, buttons) => { sent.push({ text, buttons }); },
-      events: async (_uid, today, tz) => (today === '2026-10-02' && tz === 'Asia/Singapore' ? ['09:00–10:30 Lecture (LT1)', 'All day Moot'] : []) });
+      events: async (_uid, today, tz) => (today === '2026-10-02' && tz === 'Asia/Singapore' ? ['09:00–10:30 Lecture (LT1)', 'All day Moot'] : []),
+      parcels: async (_uid, today) => (today === '2026-10-02' ? ['Keyboard: out for delivery'] : []) });
     expect(sent[0].text).toContain('<b>Calendar</b>\n• 09:00–10:30 Lecture (LT1)\n• All day Moot\n\n<b>Due today</b>');
+    expect(sent[0].text).toContain('<b>Parcels</b>\n• Keyboard: out for delivery');
     expect(sent[0].buttons).toEqual([[{ text: '✓ File the brief', data: 'done:0f8fad5b-d9cb-469f-a165-70867728950e:4' }]]);
   });
 

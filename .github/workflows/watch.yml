@@ -47,6 +47,7 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           WATCHER_OWNERS: ${{ secrets.WATCHER_OWNERS }}
           WATCHER_CALENDARS: ${{ secrets.WATCHER_CALENDARS }}
+          TRACK17_API_KEY: ${{ secrets.TRACK17_API_KEY }}
           WATCHER_TEST: ${{ inputs.test == true }}
           WATCHER_RUNNER: cloud
       # GitHub disables schedules in public repos after 60 days without commits.
