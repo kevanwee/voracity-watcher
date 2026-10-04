@@ -1,10 +1,18 @@
 // Secrets and settings shared by the cloud entry point (main.ts) and the local
 // listener (listen-main.ts). Actions logs on a public repository are public, so
 // errors here are fixed text: never secrets, owner IDs or addresses.
+import { parseRelay } from './relay.ts';
+
 export class SetupError extends Error {}
 
 /** Secrets pasted through Windows PowerShell 5.1 can arrive with a byte-order mark or a trailing newline. */
 export const secret = (name: string) => process.env[name]?.replace(/^\uFEFF/, '').trim() || undefined;
+
+/** The Telegram relay (scripts/apps-script/relay.gs), if set up. */
+export function relay() {
+  try { return parseRelay(secret('WATCHER_RELAY')); }
+  catch (error) { throw new SetupError((error as Error).message); }
+}
 
 export function owners(): Record<string, string> {
   let parsed: unknown;

@@ -9,6 +9,7 @@ import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isCha
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
 import { parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
 import { ownerTranslator } from './translate.ts';
+import { takeUpdates, type Relay } from './relay.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
 export const SCHEDULE_MS = 5 * 60_000;
@@ -170,6 +171,8 @@ export interface ListenDeps {
   mode?: 'local' | 'cloud';
   /** Private iCal feed URLs per owner (WATCHER_CALENDARS). */
   calendars?: Record<string, string[]>;
+  /** The Telegram relay (WATCHER_RELAY): when set, messages come from it instead of getUpdates. */
+  relay?: Relay | null;
   fetcher?: typeof fetch;
   now?: () => number;
   log?: (line: string) => void;
@@ -382,8 +385,25 @@ export async function pollOnce(deps: ListenDeps, offset: number, handle: (update
  * The cloud runner's stand-in while the PC is off: handle whatever is waiting, then
  * acknowledge it so neither runner sees it again.
  */
+/** How often the PC collects messages from the relay. */
+export const RELAY_POLL_MS = 3_000;
+
+/** Collect and handle one batch from the relay; returns how many messages there were. */
+export async function relayRound(deps: ListenDeps, who: 'pc' | 'cloud', handle: (update: Update) => Promise<void>) {
+  const updates = await takeUpdates(deps.relay!, who, deps.fetcher);
+  for (const update of updates) {
+    try { await handle(update); } catch { deps.log?.('message handling failed'); }
+  }
+  return updates.length;
+}
+
 export async function drainOnce(deps: ListenDeps) {
   const handle = makeHandler({ ...deps, mode: 'cloud' }, makeQueue());
+  if (deps.relay) {
+    // Messages that arrive while this run works are collected too, a few rounds at most.
+    for (let round = 0; round < 5 && await relayRound(deps, 'cloud', handle) > 0; round++);
+    return;
+  }
   const next = await pollOnce(deps, 0, handle, 0);
   if (next > 0) await pollOnce(deps, next, async () => {}, 0);
 }
@@ -398,8 +418,15 @@ export async function listen(deps: ListenDeps) {
   await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS }, deps.fetcher).catch(() => undefined);
   void scheduled();
   setInterval(() => void scheduled(), SCHEDULE_MS);
-  log('listening for commands');
+  log(deps.relay ? 'listening for commands (relay)' : 'listening for commands');
   let offset = 0, delay = 5_000;
+  if (deps.relay) {
+    // Telegram pushes to the relay; collect from it every few seconds.
+    for (;;) {
+      try { if (!await relayRound(deps, 'pc', handle)) await new Promise(resolve => setTimeout(resolve, RELAY_POLL_MS)); delay = 5_000; }
+      catch { log('relay check failed; retrying'); await new Promise(resolve => setTimeout(resolve, delay)); delay = Math.min(delay * 2, 60_000); }
+    }
+  }
   for (;;) {
     try { offset = await pollOnce(deps, offset, handle); delay = 5_000; }
     catch { log('poll failed; retrying'); await new Promise(resolve => setTimeout(resolve, delay)); delay = Math.min(delay * 2, 300_000); }

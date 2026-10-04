@@ -7,6 +7,8 @@
 #   .\scripts\local\install.ps1 -UpdateToken      Replace only the Telegram token.
 #   .\scripts\local\install.ps1 -Calendars '{"<uid>":["<secret iCal address>"]}'
 #     Add or replace only the private calendar feeds (Ica's briefing and questions).
+#   .\scripts\local\install.ps1 -Relay '{"url":"…/exec","key":"…"}'
+#     Add or replace only the Telegram relay (printed by relay.gs connectTelegram).
 #   .\scripts\local\install.ps1 -Uninstall        Remove the task and stored secrets.
 #
 # Secrets are encrypted with Windows DPAPI, so only this Windows account on this
@@ -17,6 +19,7 @@ param(
   [string]$TelegramToken,
   [switch]$UpdateToken,
   [string]$Calendars,
+  [string]$Relay,
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -46,6 +49,15 @@ if ($Calendars -and -not $ServiceAccountPath) {
   $calendarMap = $Calendars | ConvertFrom-Json
   Save-Secret 'calendars' (Secure ($calendarMap | ConvertTo-Json -Compress -Depth 4))
   Write-Output 'Calendar feeds saved. Restart the task (or sign out and in) to use them.'
+  return
+}
+
+if ($Relay -and -not $ServiceAccountPath) {
+  # Re-serialise to strict JSON for the same reason as -Owners (see below).
+  $relayValue = $Relay | ConvertFrom-Json
+  if (-not $relayValue.url -or -not $relayValue.key) { throw 'Pass the {"url":…,"key":…} line printed by connectTelegram.' }
+  Save-Secret 'relay' (Secure ($relayValue | ConvertTo-Json -Compress))
+  Write-Output 'Relay saved. Restart the task to use it.'
   return
 }
 

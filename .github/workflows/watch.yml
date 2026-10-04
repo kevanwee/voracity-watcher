@@ -12,6 +12,10 @@ on:
         description: Send a test message
         type: boolean
         default: false
+      messages:
+        description: Only answer waiting Telegram messages (the relay asks for this)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -51,6 +55,8 @@ jobs:
           WATCHER_CALENDARS: ${{ secrets.WATCHER_CALENDARS }}
           TRACK17_API_KEY: ${{ secrets.TRACK17_API_KEY }}
           WATCHER_TEST: ${{ inputs.test == true }}
+          WATCHER_MESSAGES_ONLY: ${{ inputs.messages == true }}
+          WATCHER_RELAY: ${{ secrets.WATCHER_RELAY }}
           WATCHER_RUNNER: cloud
       # GitHub disables schedules in public repos after 60 days without commits.
       # Re-enabling once a day keeps the watcher running.
