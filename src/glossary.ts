@@ -37,7 +37,7 @@ export const GLOSSARY: Record<string, string> = {
 };
 
 const KEYS = Object.keys(GLOSSARY).sort((a, b) => b.length - a.length);
-const JAPANESE = /[぀-ヿ㐀-鿿]/;
+const JAPANESE = /[\u3040-\u30ff\u3400-\u9fff]/;
 
 /** "Alphamon(Parallel)" → "Alphamon (Parallel)", full-width brackets to ASCII, spaces tidied. */
 export function tidyName(name: string) {

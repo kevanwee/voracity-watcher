@@ -30,7 +30,7 @@ const STOCKS: { re: RegExp; value: (m: RegExpMatchArray) => number | 'in' }[] = 
 ];
 
 /** Japanese or Chinese characters that are worth translating. */
-export const needsTranslation = (text: string) => /[぀-ヿ㐀-鿿]/.test(text);
+export const needsTranslation = (text: string) => /[\u3040-\u30ff\u3400-\u9fff]/.test(text);
 
 export function parseListing(raw: string): Listing {
   let rest = ` ${raw} `;
