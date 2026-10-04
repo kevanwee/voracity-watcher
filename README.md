@@ -388,6 +388,11 @@ to asking Telegram directly.
 
 ## Parcels
 
+> **Archived (4 October 2026).** Parcel tracking is switched off: no checks, no briefing
+> section, and `track` / `/parcels` reply that it's archived. The code below is kept. To
+> bring it back, set `PARCELS_ENABLED = true` in `src/parcels.ts`, add the
+> `TRACK17_API_KEY` secret, and restore the Parcels card in Voracity.
+
 Track deliveries from Voracity's **Parcels** card, or send Ica
 `track <number> <name>`. Examples: `track SPXSG012345678901 keyboard`, or `/track` with
 the number and then the name.
