@@ -7,7 +7,7 @@ import { localClock, settingsFrom, type AssistantSettings, type Bookmark } from 
 import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
 import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
-import { parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
+import { PARCELS_ARCHIVED_REPLY, PARCELS_ENABLED, parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
 import { ownerTranslator } from './translate.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
@@ -162,6 +162,8 @@ export interface CaptureStore extends EditStore {
 }
 
 export interface ListenDeps {
+  /** Overrides PARCELS_ENABLED (tests). */
+  parcelsEnabled?: boolean;
   token: string;
   owners: Record<string, string>;
   store: Store & CaptureStore;
@@ -282,6 +284,8 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (!uid) return; // Only owners in WATCHER_OWNERS can talk to Ica; everyone else is ignored.
     const command = parseCommand(message.text);
     if (command?.name === 'help') { await send(chatId, helpReply()); return; }
+    const parcelsOn = deps.parcelsEnabled ?? PARCELS_ENABLED;
+    if (command?.name === 'parcels' && !parcelsOn) { await send(chatId, PARCELS_ARCHIVED_REPLY); return; }
     if (command?.name === 'parcels') {
       const [parcels, states] = await Promise.all([deps.store.parcels(uid), deps.store.parcelStates(uid)]);
       await send(chatId, parcelsReply(parcels, states));
@@ -327,6 +331,7 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     }
     const captured = parseCapture(message.text ?? '', date);
     if (captured && 'error' in captured) { await send(chatId, `${GREETING}\n${escapeHtml(captured.error)}`); return; }
+    if (captured?.kind === 'parcel' && !parcelsOn) { await send(chatId, PARCELS_ARCHIVED_REPLY); return; }
     if (captured) {
       await offer(uid, chatId, [captured], date, false);
       log(`capture proposed: ${captured.kind}`);
@@ -395,7 +400,7 @@ export async function listen(deps: ListenDeps) {
   const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local', translate: deps.base?.translate ?? ownerTranslator(deps.store, deps.fetcher),
     send: (chatId, text) => sendTelegram(deps.token, chatId, text, deps.fetcher) })).catch(() => log('scheduled run failed'));
   // Show the commands in Telegram's "/" menu.
-  await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS }, deps.fetcher).catch(() => undefined);
+  await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS.filter(c => PARCELS_ENABLED || !['track', 'parcels'].includes(c.command)) }, deps.fetcher).catch(() => undefined);
   void scheduled();
   setInterval(() => void scheduled(), SCHEDULE_MS);
   log('listening for commands');

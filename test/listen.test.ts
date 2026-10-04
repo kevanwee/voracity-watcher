@@ -354,8 +354,20 @@ describe('queue and polling', () => {
 });
 
 describe('tracking parcels from Telegram', () => {
+  it('replies that parcel tracking is archived, and still treats "track my …" as a question', async () => {
+    const s = setup([]); // archived by default (PARCELS_ENABLED = false)
+    await s.handle(s.message('track SPXSG012345678901 keyboard'));
+    expect(s.sent.at(-1)).toBe("Doot Doot.\nParcel tracking is archived, so I'm not tracking parcels right now.");
+    await s.handle(s.message('/parcels'));
+    expect(s.sent.at(-1)).toContain('Parcel tracking is archived');
+    expect(s.parcels).toEqual([]);
+    await s.handle(s.message('track my budget this month'));
+    expect(s.sent.at(-1)).toContain("I couldn't reach the AI on your PC");
+  });
+
   it('proposes a parcel from "track …", saves it as Voracity would, and refuses a repeat', async () => {
     const s = setup([]);
+    s.deps.parcelsEnabled = true;
     await s.handle(s.message('track spxsg012345678901 keyboard from lazada'));
     expect(s.sent.at(-1)).toBe('Doot Doot.\nTrack this parcel?\n<b>Keyboard from lazada</b>\n<code>SPXSG012345678901</code>');
     expect(s.parcels).toEqual([]);
@@ -374,6 +386,7 @@ describe('tracking parcels from Telegram', () => {
 
   it('keeps "track my …" as a question, explains a bare /track, and lists parcels', async () => {
     const s = setup([]);
+    s.deps.parcelsEnabled = true;
     await s.handle(s.message('/track'));
     expect(s.sent.at(-1)).toContain('Send /track with the tracking number');
     await s.handle(s.message('track my budget this month'));

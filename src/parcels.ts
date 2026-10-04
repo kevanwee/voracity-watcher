@@ -27,6 +27,14 @@ export interface ParcelStore {
   createParcel(uid: string, parcel: Parcel): Promise<void>;
 }
 
+/**
+ * Parcel tracking is archived (owner's decision, 4 October 2026): no checks, no briefing
+ * section, and track or /parcels get a short reply. The code, data and Voracity rules are
+ * kept; set this to true to bring it back.
+ */
+export const PARCELS_ENABLED = false;
+export const PARCELS_ARCHIVED_REPLY = "Doot Doot.\nParcel tracking is archived, so I'm not tracking parcels right now.";
+
 export const POLL_MS = 30 * 60_000;
 const SETTLED_POLL_MS = 24 * 3_600_000;
 /** A refused registration costs no quota; try again after this long. */
