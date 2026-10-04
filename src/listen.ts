@@ -8,6 +8,7 @@ import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
 import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
 import { parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
+import { ownerTranslator } from './translate.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
 export const SCHEDULE_MS = 5 * 60_000;
@@ -307,7 +308,7 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
       checking = true;
       try {
         await send(chatId, `${GREETING}\nChecking${filter ? ` “${escapeHtml(command.filter)}”` : ''} now…`);
-        const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match } }));
+        const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match }, translate: deps.base?.translate ?? ownerTranslator(deps.store, deps.fetcher) }));
         const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
         const cloud = watches.filter(watch => watch.enabled && match(watch) && routeOf(states.get(watch.id), watch) === 'cloud').map(watch => watch.label);
         await send(chatId, checkReply(totals.outcomes, cloud, command.filter));
@@ -391,7 +392,7 @@ export async function listen(deps: ListenDeps) {
   const log = deps.log ?? (() => {});
   const enqueue = makeQueue();
   const handle = makeHandler({ ...deps, mode: 'local' }, enqueue);
-  const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local',
+  const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local', translate: deps.base?.translate ?? ownerTranslator(deps.store, deps.fetcher),
     send: (chatId, text) => sendTelegram(deps.token, chatId, text, deps.fetcher) })).catch(() => log('scheduled run failed'));
   // Show the commands in Telegram's "/" menu.
   await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS }, deps.fetcher).catch(() => undefined);
