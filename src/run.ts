@@ -1,4 +1,6 @@
 import { SelectorError, diffItems, extractItems, isEmptyDiff, summarise } from './extract.ts';
+import { classify, headline, namesIn, needsTranslation } from './insight.ts';
+import { trimCache, type Translate } from './translate.ts';
 import { VERSION, fetchPage, fetchRobots } from './fetch.ts';
 import { isAllowed, type RobotsPolicy } from './robots.ts';
 import { baselineMessage, changeMessage, handoffMessage, problemMessage, recoveredMessage, testMessage } from './telegram.ts';
@@ -19,7 +21,11 @@ export interface WatchState {
   /** When the watch moved to the local runner. The cloud runner never contacts it again. */
   movedAt?: number;
 }
-export interface ItemsDoc { items: string[]; url: string; selector: string; ignore: string; etag?: string; lastModified?: string }
+export interface ItemsDoc {
+  items: string[]; url: string; selector: string; ignore: string; etag?: string; lastModified?: string;
+  /** English names for Japanese ones, translated on the PC and kept so each is translated once. */
+  names?: Record<string, string>;
+}
 
 export interface Store {
   watches(uid: string): Promise<Watch[]>;
@@ -46,6 +52,8 @@ export interface Deps {
    * still honours backoff, Retry-After and a one-minute per-watch cooldown.
    */
   manual?: { uid: string; match?: (watch: Watch) => boolean };
+  /** Translates Japanese names for alerts (the PC's local model); absent in the cloud. */
+  translate?: Translate;
   /** Stop starting new checks after this long, so runs never overlap the next schedule. */
   budgetMs?: number;
 }
@@ -140,7 +148,7 @@ export async function runOnce(deps: Deps) {
   const robots = new Map<string, Promise<RobotsPolicy>>();
   const lastRequest = new Map<string, number>();
   const perHost = new Map<string, number>();
-  const totals = { due: 0, checked: 0, changed: 0, failed: 0, postponed: 0, moved: 0, notified: 0, sendFailures: 0, outcomes: [] as Outcome[] };
+  const totals = { due: 0, checked: 0, changed: 0, failed: 0, postponed: 0, moved: 0, notified: 0, sendFailures: 0, translated: 0, outcomes: [] as Outcome[] };
   const record = (watch: Watch, kind: OutcomeKind, detail: string) => { totals.outcomes.push({ label: watch.label, kind, detail }); };
 
   async function politely<T>(host: string, spacing: number, request: () => Promise<T>) {
@@ -237,7 +245,8 @@ export async function runOnce(deps: Deps) {
       try { items = extractItems(result.html, watch.selector, watch.ignore); }
       catch (error) { await fail(error instanceof SelectorError ? error.message : 'could not read the page', 1); continue; }
 
-      const next: ItemsDoc = { items, url: watch.url, selector: watch.selector, ignore: watch.ignore, etag: result.etag, lastModified: result.lastModified };
+      const next: ItemsDoc = { items, url: watch.url, selector: watch.selector, ignore: watch.ignore, etag: result.etag, lastModified: result.lastModified,
+        ...(sameSettings && previous?.names ? { names: previous.names } : {}) };
       const base = { ...carry(previousState), status: 'ok' as const, checkedAt: now(), itemCount: items.length, failures: 0, alerted, ...(runner === 'cloud' ? { cloudRefusals: 0 } : {}) };
       if (!sameSettings) {
         // First check, or the address/selector changed: record a fresh baseline.
@@ -255,10 +264,21 @@ export async function runOnce(deps: Deps) {
         continue;
       }
       totals.changed++;
-      record(watch, 'changed', summarise(diff));
+      const insight = classify(diff);
+      const summary = headline(insight) || summarise(diff);
+      record(watch, 'changed', summary);
+      // English names for Japanese listings: cached ones, plus any new ones from the local model.
+      const shown = namesIn(insight).filter(needsTranslation);
+      let names = { ...(previous.names ?? {}) };
+      const missing = shown.filter(name => !(name in names));
+      if (missing.length && deps.translate) {
+        try { names = { ...names, ...(await deps.translate(uid, missing)) }; totals.translated += missing.length; }
+        catch { log('translation unavailable; sending original names'); }
+      }
+      if (Object.keys(names).length) next.names = trimCache(names, new Set(shown));
       // Keep the old snapshot if Telegram is unreachable, so the change is reported next run.
-      if (await notify(changeMessage(watch.label, watch.url, diff))) {
-        await deps.store.save(uid, watch.id, { ...base, changedAt: now(), summary: summarise(diff) }, next);
+      if (await notify(changeMessage(watch.label, watch.url, diff, names))) {
+        await deps.store.save(uid, watch.id, { ...base, changedAt: now(), summary }, next);
       } else {
         await deps.store.save(uid, watch.id, { ...base, itemCount: previous.items.length }, undefined);
       }
@@ -267,7 +287,7 @@ export async function runOnce(deps: Deps) {
     // Counts only: public Actions logs must never contain addresses, owners or page content.
     log(`owner ${ownerIndex + 1}: ${watches.length} watches`);
   }
-  log(`${runner} runner: due ${totals.due}, checked ${totals.checked}, changed ${totals.changed}, failed ${totals.failed}, postponed ${totals.postponed}, moved ${totals.moved}, messages ${totals.notified}, message failures ${totals.sendFailures}`);
+  log(`${runner} runner: due ${totals.due}, checked ${totals.checked}, changed ${totals.changed}, failed ${totals.failed}, postponed ${totals.postponed}, moved ${totals.moved}, messages ${totals.notified}, message failures ${totals.sendFailures}, names translated ${totals.translated}`);
   return totals;
 }
 

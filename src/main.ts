@@ -6,6 +6,7 @@ import { drainOnce } from './listen.ts';
 import { briefingParcels, runParcels } from './parcels.ts';
 import { runOnce } from './run.ts';
 import { track17 } from './track17.ts';
+import { ownerTranslator } from './translate.ts';
 import { sendTelegram } from './telegram.ts';
 
 /** The PC listener counts as away when it hasn't checked in for this long. */
@@ -21,7 +22,8 @@ try {
   const send = (chatId: string, text: string, buttons?: { text: string; data: string }[][]) => sendTelegram(token, chatId, text, undefined, buttons);
   const feeds = calendars();
   const log = (line: string) => console.log(line);
-  await runOnce({ owners: ownerMap, store, send, test: process.env.WATCHER_TEST === 'true', runner, log });
+  // On the PC, Japanese names in alerts are translated by the local model; the cloud has none.
+  await runOnce({ owners: ownerMap, store, send, test: process.env.WATCHER_TEST === 'true', runner, log, translate: runner === 'local' ? ownerTranslator(store) : undefined });
   if (runner === 'cloud') {
     // Parcels first, so the briefing has their latest status. A 17TRACK outage doesn't stop the run.
     const trackKey = secret('TRACK17_API_KEY');

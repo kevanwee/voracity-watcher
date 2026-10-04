@@ -234,6 +234,44 @@ The first check, or the first check after you change a watch's address, selector
 ignore pattern, records a baseline and confirms it on Telegram. Sites that require a login
 or build their content with JavaScript can't be watched.
 
+### What an alert says
+
+Alerts open with a one-line summary, then what matters:
+
+```
+Doot Doot.
+Digimon EX13: 1 sold out, 1 price drop, 4 stock changes.
+
+🔴 Sold out
+• Alphamon (Parallel) · ¥2,480
+
+💸 Price down
+• Omnimon (Parallel): ¥3,480 → ¥2,980
+
+📦 Stock: Jesmon (Parallel) 3→2 · Magnamon (Parallel) 8→7 · …
+
+▸ Full list   (tap to expand: every entry, before → after, with the original name)
+Open the page
+```
+
+- **Reading each line:** the alert finds the price (`円`, `¥`, `$`, `S$`) and the
+  stock (`在庫 : 3 点`, `在庫 : ×`, "sold out", "3 left", "in stock") in every entry.
+  - It sorts changes into sold out, back in stock, new, price down, price up, stock
+    counts and anything else.
+  - Lines it can't read still show in the full list as before → after.
+- **The full list** sits in a collapsed quote that you tap to open, trimmed to fit
+  Telegram's message limit.
+- **Japanese names are translated to English on your PC**, for watches the local
+  runner checks (such as yuyu-tei):
+  - A built-in glossary covers common names exactly and instantly: the Digimon Royal
+    Knights, Parallel, Special Edition and so on.
+  - Anything else goes to the Ollama model you chose for Second Brain, on localhost
+    only. Each name is translated once and remembered with the watch.
+  - If the model isn't running, the alert goes out with the original names.
+  - The cloud runner never translates, and nothing is sent to an outside service.
+- **Ignore pattern:** you no longer need one to hide stock noise, since stock changes
+  are summarised on a single line. Use one only if you don't want stock alerts at all.
+
 ## Setup
 
 You need a Voracity notes account, a Telegram account, and access to the Voracity

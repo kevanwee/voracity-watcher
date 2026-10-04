@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { Translate } from '../src/translate.ts';
 import { USER_AGENT } from '../src/fetch.ts';
 import { backoff, hostLimits, isDue, runOnce, type ItemsDoc, type Store, type Watch, type WatchState } from '../src/run.ts';
 
@@ -44,7 +45,7 @@ function world(routes: Record<string, () => Response>) {
 const ok = (body: string, headers: Record<string, string> = {}) => () => new Response(body, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', ...headers } });
 const robots = (body: string) => () => new Response(body, { status: 200, headers: { 'content-type': 'text/plain' } });
 
-async function run(env: ReturnType<typeof world>, store: Store, extra: { test?: boolean; runner?: 'cloud' | 'local' } = {}) {
+async function run(env: ReturnType<typeof world>, store: Store, extra: { test?: boolean; runner?: 'cloud' | 'local'; translate?: Translate } = {}) {
   const sent: string[] = [], logs: string[] = [];
   const totals = await runOnce({ owners: { [UID]: CHAT }, store, fetcher: env.fetcher, now: env.now, sleep: env.sleep, log: line => logs.push(line), send: async (chat, text) => { expect(chat).toBe(CHAT); sent.push(text); }, ...extra });
   return { sent, logs, totals };
@@ -87,9 +88,40 @@ describe('a watcher run', () => {
     body = html('EX13-001 Agumon 880 円', 'EX13-002 Gabumon 1,200 円');
     const third = await run(env, memory.store);
     expect(third.sent).toHaveLength(1);
-    expect(third.sent[0]).toContain('1 new, 1 changed');
-    expect(third.sent[0]).toContain('<i>was: EX13-001 Agumon 980 円</i>');
-    expect(memory.states.get('w1')).toMatchObject({ summary: '1 new, 1 changed', changedAt: env.now(), itemCount: 2 });
+    expect(third.sent[0]).toContain('<b>EX13</b>: 1 new, 1 price drop.');
+    expect(third.sent[0]).toContain('<b>💸 Price down</b>\n• Agumon: ¥980 → <b>¥880</b>');
+    expect(third.sent[0]).toContain('• EX13-001 Agumon: ¥980 → ¥880');
+    expect(memory.states.get('w1')).toMatchObject({ summary: '1 new, 1 price drop', changedAt: env.now(), itemCount: 2 });
+  });
+
+  it('translates Japanese names once on the PC, caches them, and still alerts without the model', async () => {
+    const memory = memoryStore([watch({ runOn: 'local' })]); // a watch on the PC, like yuyu-tei
+    let body = html('EX13-060 アルファモン(パラレル) 2,480 円 在庫 : 1 点', 'EX13-014 ジエスモン(パラレル) 1,980 円 在庫 : 3 点');
+    const env = world({ 'https://shop.example/robots.txt': robots('User-agent: *'), 'https://shop.example/sell/ex13': () => ok(body)() });
+    const asked: string[][] = [];
+    const translate: Translate = async (_uid, names) => { asked.push(names); return Object.fromEntries(names.map(n => [n, n.startsWith('アルファ') ? 'Alphamon (Parallel)' : 'Jesmon (Parallel)'])); };
+    await run(env, memory.store, { runner: 'local', translate }); // baseline: nothing translated yet
+    expect(asked).toEqual([]);
+
+    env.advance(5 * 60_000);
+    body = html('EX13-060 アルファモン(パラレル) 2,480 円 在庫 : ×', 'EX13-014 ジエスモン(パラレル) 1,980 円 在庫 : 3 点');
+    const sold = await run(env, memory.store, { runner: 'local', translate });
+    expect(asked).toEqual([['アルファモン(パラレル)']]); // only names the alert shows
+    expect(sold.sent[0]).toContain('<b>🔴 Sold out</b>\n• Alphamon (Parallel) · ¥2,480');
+    expect(memory.items.get('w1')!.names).toEqual({ 'アルファモン(パラレル)': 'Alphamon (Parallel)' });
+    expect(memory.states.get('w1')!.summary).toBe('1 sold out');
+
+    env.advance(5 * 60_000);
+    body = html('EX13-060 アルファモン(パラレル) 2,480 円 在庫 : 2 点', 'EX13-014 ジエスモン(パラレル) 1,980 円 在庫 : 2 点');
+    await run(env, memory.store, { runner: 'local', translate });
+    expect(asked.at(-1)).toEqual(['ジエスモン(パラレル)']); // Alphamon came from the cache
+
+    env.advance(5 * 60_000);
+    body = html('EX13-060 アルファモン(パラレル) 2,480 円 在庫 : 1 点', 'EX13-014 ジエスモン(パラレル) 1,980 円 在庫 : 2 点', 'EX13-070 オメガモンX 3,980 円 在庫 : 1 点');
+    const offline = await run(env, memory.store, { runner: 'local', translate: async () => { throw new Error('Ollama is off'); } });
+    expect(offline.sent[0]).toContain('<b>✨ New</b>\n• オメガモンX · ¥3,980 · 1 left');
+    expect(offline.logs).toContain('translation unavailable; sending original names');
+    expect(memory.items.get('w1')!.names).toMatchObject({ 'アルファモン(パラレル)': 'Alphamon (Parallel)', 'ジエスモン(パラレル)': 'Jesmon (Parallel)' });
   });
 
   it('never fetches pages robots.txt disallows, and says so once', async () => {
