@@ -19,6 +19,7 @@ $env:TELEGRAM_BOT_TOKEN = Read-Secret 'telegram-token'
 $env:FIREBASE_SERVICE_ACCOUNT = Read-Secret 'service-account'
 $env:WATCHER_OWNERS = Read-Secret 'owners'
 if (Test-Path (Join-Path $dir 'calendars.secret')) { $env:WATCHER_CALENDARS = Read-Secret 'calendars' }
+if (Test-Path (Join-Path $dir 'relay.secret')) { $env:WATCHER_RELAY = Read-Secret 'relay' }
 $env:WATCHER_TEST = if ($Test) { 'true' } else { 'false' }
 # Only watches GitHub handed over (route 'local') are checked here.
 $env:WATCHER_RUNNER = 'local'

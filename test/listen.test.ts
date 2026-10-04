@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Parcel } from '../src/parcels.ts';
-import { drainOnce, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
+import { drainOnce, relayRound, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from '../src/run.ts';
 import type { CardDoc } from '../src/edit.ts';
 
@@ -45,8 +45,17 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   const sent: string[] = [], pages: string[] = [], edits: string[] = [], buttons: unknown[] = [], toasts: string[] = [], ollamaUrls: string[] = [];
   let offsets: number[] = [];
   let pendingUpdates: Update[] = [];
+  const relayCalls: string[] = [];
   const fetcher = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url.startsWith('https://script.google.com/macros/s/')) {
+      // A fake relay: hands out whatever is queued, once.
+      const params = new URL(url).searchParams;
+      expect(params.get('key')).toBe('k'.repeat(40));
+      relayCalls.push(`${params.get('action')}:${params.get('who')}`);
+      const updates = pendingUpdates; pendingUpdates = [];
+      return new Response(JSON.stringify({ updates }));
+    }
     if (url.startsWith(`https://api.telegram.org/bot${TOKEN}/sendMessage`)) {
       const body = JSON.parse(String(init?.body));
       expect(body.chat_id).toBe(CHAT);
@@ -77,7 +86,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
   const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
   const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
-  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
+  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, relayCalls, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
     queue: (updates: Update[]) => { pendingUpdates = updates; }, offsets: () => offsets, advance: (ms: number) => { clock += ms; } };
 }
 
@@ -225,6 +234,34 @@ describe('quick capture', () => {
     expect(s.sent[0]).toContain("Your PC is off or asleep, so <b>EX13 singles</b> waits until it's back.");
     expect(s.sent[1]).toContain('<b>Water plants</b>\nDue: today');
     expect(s.offsets()).toEqual([0, 43]); // the second call confirms both updates
+  });
+});
+
+describe('the Telegram relay', () => {
+  it('in the cloud, collects from the relay instead of Telegram, until it is empty', async () => {
+    const s = setup([]);
+    s.deps.relay = { url: 'https://script.google.com/macros/s/abc_DEF-123/exec', key: 'k'.repeat(40) };
+    const now = Math.floor(1_800_000_000_000 / 1000);
+    s.queue([
+      { update_id: 41, message: { date: now, text: 'remind me to water plants today', chat: { id: Number(CHAT) } } },
+      { update_id: 42, message: { date: now, text: 'note: buy stamps', chat: { id: Number(CHAT) } } },
+    ]);
+    await drainOnce(s.deps);
+    expect(s.sent).toHaveLength(2);
+    expect(s.sent[0]).toContain('<b>Water plants</b>');
+    expect(s.sent[1]).toContain('<b>Buy stamps</b>');
+    expect(s.offsets()).toEqual([]); // never getUpdates while the relay is in use
+    expect(s.relayCalls).toEqual(['take:cloud', 'take:cloud']); // a second look finds nothing more
+  });
+
+  it('on the PC, takes and handles one batch at a time', async () => {
+    const s = setup([]);
+    s.deps.relay = { url: 'https://script.google.com/macros/s/abc_DEF-123/exec', key: 'k'.repeat(40) };
+    s.queue([{ update_id: 7, message: { date: Math.floor(1_800_000_000_000 / 1000), text: '/help', chat: { id: Number(CHAT) } } }]);
+    expect(await relayRound(s.deps, 'pc', s.handle)).toBe(1);
+    expect(s.sent.at(-1)).toContain('/check');
+    expect(await relayRound(s.deps, 'pc', s.handle)).toBe(0);
+    expect(s.relayCalls).toEqual(['take:pc', 'take:pc']);
   });
 });
 

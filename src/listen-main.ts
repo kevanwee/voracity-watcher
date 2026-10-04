@@ -1,4 +1,4 @@
-import { SetupError, calendars, owners, safeError, secret, serviceAccount } from './config.ts';
+import { SetupError, calendars, owners, relay, safeError, secret, serviceAccount } from './config.ts';
 import { firestoreStore } from './firestore.ts';
 import { listen } from './listen.ts';
 
@@ -7,7 +7,7 @@ try {
   const token = secret('TELEGRAM_BOT_TOKEN');
   if (!token) throw new SetupError('TELEGRAM_BOT_TOKEN is not set');
   const log = (line: string) => console.log(line);
-  await listen({ token, owners: owners(), store: firestoreStore(serviceAccount()), base: { log }, log, calendars: calendars() });
+  await listen({ token, owners: owners(), store: firestoreStore(serviceAccount()), base: { log }, log, calendars: calendars(), relay: relay() });
 } catch (error) {
   console.error(`Watcher listener failed: ${safeError(error)}`);
   process.exitCode = 1;

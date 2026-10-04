@@ -341,6 +341,51 @@ The cost stays at zero:
 - With a few watches, each run reads about 13 Firestore documents and writes about 4:
   roughly 3,700 reads and 1,200 writes a day, against free limits of 50,000 and 20,000.
 
+### Replies in about 30 seconds (optional)
+
+The timer above means Ica answers within 5 minutes while your PC is off. For about 30
+seconds, add the **relay**:
+
+- **How it works:** Telegram pushes each message to your Apps Script the moment you send
+  it. The script keeps it in a small queue and asks GitHub to run Ica straight away.
+- **When your PC is on,** it collects from the same queue every 3 seconds, so replies
+  stay near-instant and no GitHub run is started.
+- **Nothing is answered in the script.** It only holds messages until a runner collects
+  them, and each one is handed out once.
+
+1. In the same Apps Script project as `wake.gs`, add a file named `relay` and paste
+   [`scripts/apps-script/relay.gs`](scripts/apps-script/relay.gs).
+2. In **Script properties**, add `TELEGRAM_BOT_TOKEN` (from @BotFather).
+3. **Deploy → New deployment → Web app**, with *Execute as: Me* and *Who has access:
+   Anyone*. Copy the web app URL (ending in `/exec`) and add it as the `WEB_APP_URL`
+   script property.
+   - *Anyone* is needed so Telegram can reach it. A long random key in the address
+     keeps everyone else out.
+4. Run **connectTelegram**. It prints a line like `{"url":"…/exec","key":"…"}`.
+5. Save that line to a file, then add it as the `WATCHER_RELAY` secret in two places:
+   - GitHub: `gh secret set WATCHER_RELAY < relay.json`
+   - your PC: `.\scripts\local\install.ps1 -Relay (Get-Content relay.json -Raw)`, then
+     restart the *Voracity watcher* task
+   - then delete `relay.json`.
+
+**Timing:**
+- PC off: a message-only run takes about 20–30 s from your message to Ica's reply. It
+  skips site checks.
+- PC on: a few seconds.
+
+**To undo,** run **disconnectTelegram** and remove `WATCHER_RELAY` from GitHub and the
+PC (`Remove-Item $env:USERPROFILE\.voracity-watcher\relay.secret`). Ica then goes back
+to asking Telegram directly.
+
+**Things to know:**
+- **Use it fully or not at all.** While the webhook is on, Telegram refuses the old way
+  of collecting messages. So `WATCHER_RELAY` must be set on both GitHub and the PC.
+- **Quotas:** each message uses a few Apps Script calls, and the PC's checks (one every
+  3 s, about 29,000 a day) stay within Apps Script's free daily limits for web apps and
+  properties.
+- **If you edit the script,** deploy a new version of the web app so Telegram reaches
+  the updated code.
+
 ## Parcels
 
 > **Archived (4 October 2026).** Parcel tracking is switched off: no checks, no briefing
