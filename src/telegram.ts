@@ -1,19 +1,13 @@
 import type { Diff } from './extract.ts';
 import { summarise } from './extract.ts';
+import { classify, formatPrice, formatStock, headline, type Insight, type Listing, type Move } from './insight.ts';
 
 /** Ica opens every message this way. */
 export const GREETING = process.env.WATCHER_GREETING ?? 'Doot Doot.';
 const LIMIT = 4000; // Telegram allows 4096 characters per message.
-const PER_SECTION = 10;
 
 export const escapeHtml = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const link = (url: string, text: string) => `<a href="${escapeHtml(url).replace(/"/g, '&quot;')}">${escapeHtml(text)}</a>`;
-
-function section(title: string, lines: string[]) {
-  if (!lines.length) return [];
-  const shown = lines.slice(0, PER_SECTION);
-  return [`\n<b>${title}</b>`, ...shown, ...(lines.length > shown.length ? [`…and ${lines.length - shown.length} more`] : [])];
-}
 
 function fit(lines: string[]) {
   let text = lines.join('\n');
@@ -21,16 +15,68 @@ function fit(lines: string[]) {
   return text.length > LIMIT ? text.slice(0, LIMIT - 1) + '…' : text;
 }
 
-export function changeMessage(label: string, url: string, diff: Diff) {
-  return fit([
-    GREETING,
-    `<b>${escapeHtml(label)}</b> changed: ${escapeHtml(summarise(diff))}.`,
-    ...section('New', diff.added.map(item => '• ' + escapeHtml(item))),
-    ...section('Changed', diff.changed.map(({ before, after }) => `• ${escapeHtml(after)}\n   <i>was: ${escapeHtml(before)}</i>`)),
-    ...section('Gone', diff.removed.map(item => '• ' + escapeHtml(item))),
-    '',
-    link(url, 'Open the page'),
-  ]);
+/** How many entries each highlight group shows before "…and N more". */
+const PER_GROUP = 5;
+const stockMark = (stock: Listing['stock']) => (stock === 0 ? '×' : stock === 'in' ? '✓' : String(stock ?? '?'));
+
+/**
+ * A change alert: a one-line summary, what matters (sold out, back in stock, new, price
+ * moves, then stock counts on one line), and the full before → after list folded away in
+ * an expandable quote. `names` holds English names for Japanese ones, when translated.
+ */
+export function changeMessage(label: string, url: string, diff: Diff, names: Record<string, string> = {}) {
+  const insight = classify(diff);
+  const name = (listing: Listing) => escapeHtml(names[listing.name] ?? listing.name);
+  const price = (listing: Listing) => (listing.price ? ` · ${formatPrice(listing.price)}` : '');
+  const lines = [GREETING, `<b>${escapeHtml(label)}</b>: ${escapeHtml(headline(insight) || summarise(diff))}.`];
+  const group = (title: string, items: string[]) => {
+    if (!items.length) return;
+    lines.push('', `<b>${title}</b>`, ...items.slice(0, PER_GROUP).map(item => `• ${item}`), ...(items.length > PER_GROUP ? [`…and ${items.length - PER_GROUP} more`] : []));
+  };
+  group('🔴 Sold out', insight.soldOut.map(m => `${name(m.after)}${price(m.after)}`));
+  group('🟢 Back in stock', insight.restocked.map(m => `${name(m.after)} · ${formatStock(m.after.stock)}${price(m.after)}`));
+  group('✨ New', insight.added.map(l => `${name(l)}${price(l)}${l.stock !== undefined ? ` · ${formatStock(l.stock)}` : ''}`));
+  group('💸 Price down', insight.priceDown.map(m => `${name(m.after)}: ${formatPrice(m.before.price)} → <b>${formatPrice(m.after.price)}</b>`));
+  group('📈 Price up', insight.priceUp.map(m => `${name(m.after)}: ${formatPrice(m.before.price)} → <b>${formatPrice(m.after.price)}</b>`));
+  if (insight.stock.length) {
+    const shown = insight.stock.slice(0, 6).map(m => `${name(m.after)} ${stockMark(m.before.stock)}→${stockMark(m.after.stock)}`);
+    lines.push('', `📦 <b>Stock</b>: ${shown.join(' · ')}${insight.stock.length > shown.length ? ` · +${insight.stock.length - shown.length} more` : ''}`);
+  }
+  group('✏️ Changed', insight.other.map(m => name(m.after)));
+  group('👋 Gone', insight.removed.map(l => name(l)));
+
+  // The full list, folded: every entry with what changed, and the original name when translated.
+  const tail = ['', link(url, 'Open the page')];
+  const full = fullList(insight, names);
+  let budget = LIMIT - [...lines, ...tail].join('\n').length - 80;
+  const kept: string[] = [];
+  for (const line of full) { if (line.length + 1 > budget) break; kept.push(line); budget -= line.length + 1; }
+  if (kept.length) {
+    if (kept.length < full.length) kept.push(`…and ${full.length - kept.length} more on the page`);
+    lines.push('', `<blockquote expandable><b>Full list</b>\n${kept.join('\n')}</blockquote>`);
+  }
+  return fit([...lines, ...tail]);
+}
+
+function fullList(insight: Insight, names: Record<string, string>) {
+  const label = (l: Listing) => {
+    const english = names[l.name];
+    return `${l.code ? `${escapeHtml(l.code)} ` : ''}${escapeHtml(english ?? l.name)}${english ? ` <i>(${escapeHtml(l.name)})</i>` : ''}`;
+  };
+  const what = ({ before, after }: Move) => {
+    const priceMoved = !!before.price && !!after.price && before.price.amount !== after.price.amount;
+    const parts: string[] = [];
+    if (priceMoved) parts.push(`${formatPrice(before.price)} → ${formatPrice(after.price)}`);
+    if (before.stock !== after.stock) parts.push(`stock ${stockMark(before.stock)} → ${stockMark(after.stock)}`);
+    if (!parts.length) return `was: ${escapeHtml(before.raw)}`;
+    if (!priceMoved && after.price) parts.unshift(formatPrice(after.price));
+    return parts.join(', ');
+  };
+  return [
+    ...[...insight.soldOut, ...insight.restocked, ...insight.priceDown, ...insight.priceUp, ...insight.stock, ...insight.other].map(m => `• ${label(m.after)}: ${what(m)}`),
+    ...insight.added.map(l => `• ${label(l)}: new${l.price ? `, ${formatPrice(l.price)}` : ''}${l.stock !== undefined ? `, ${formatStock(l.stock)}` : ''}`),
+    ...insight.removed.map(l => `• ${label(l)}: gone`),
+  ];
 }
 
 export function baselineMessage(label: string, url: string, count: number, selector: string) {

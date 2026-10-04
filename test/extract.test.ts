@@ -64,7 +64,8 @@ describe('Telegram messages', () => {
     expect(text.startsWith('Doot Doot.\n')).toBe(true);
     expect(text).toContain('&lt;singles&gt;');
     expect(text).toContain('&lt;b&gt;Card&lt;/b&gt; &amp; co');
-    expect(text).toContain('…and 30 more');
+    expect(text).toContain('…and 35 more'); // five highlights per group
+    expect(text).toMatch(/<blockquote expandable><b>Full list<\/b>[\s\S]*more on the page<\/blockquote>/); // folded list trimmed, tag kept
     expect(text).toContain('href="https://shop.example/a?b=1&amp;c=&quot;2&quot;"');
     expect(text.length).toBeLessThanOrEqual(4000);
     expect(baselineMessage('EX13', 'https://x.example', 0, '.card-product')).toContain('0 items match <code>.card-product</code>');
