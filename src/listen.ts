@@ -2,7 +2,8 @@
 // the 5-minute schedule, all through one queue so a requested check never overlaps a
 // scheduled one. When the PC is off, the cloud runner reads pending messages instead
 // (mode 'cloud'), so quick capture still works from a phone.
-import { DEFAULT_OLLAMA, answerQuestion, localOllamaUrl } from './agent.ts';
+import { answerQuestion } from './agent.ts';
+import { localModel, type LocalModel } from './local-model.ts';
 import { localClock, settingsFrom, type AssistantSettings, type Bookmark } from './assistant.ts';
 import { formatDue, parseCapture, type Proposal } from './capture.ts';
 import { changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
@@ -143,8 +144,6 @@ export type NewCard = ReturnType<typeof cardFor>;
 export type NewBookmark = ReturnType<typeof bookmarkFor>;
 export interface CaptureStore extends EditStore, ConfirmationStore, DeliveryStore {
   settings(uid: string): Promise<Partial<AssistantSettings> | null>;
-  /** The owner's Second Brain settings (users/{uid}/settings/brain): local model and address. */
-  brainSettings(uid: string): Promise<{ ollamaUrl?: string; ollamaModel?: string } | null>;
   unreadBookmarks(uid: string): Promise<Bookmark[]>;
   parcels(uid: string): Promise<Parcel[]>;
   parcelStates(uid: string): Promise<Map<string, ParcelState>>;
@@ -155,6 +154,7 @@ export interface ListenDeps {
   /** Overrides PARCELS_ENABLED (tests). */
   parcelsEnabled?: boolean;
   token: string;
+  ollama?: LocalModel;
   owners: Record<string, string>;
   store: Store & CaptureStore;
   base: Omit<Deps, 'owners' | 'store' | 'send' | 'runner' | 'manual' | 'test'>;
@@ -279,6 +279,10 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
         health = `\nDelivery queue: ${relay.pending} waiting; ${relay.failed ?? 0} failed in the last seven days.`;
         if (relay.fault) health += `\nRelay needs attention (${escapeHtml(relay.fault.reason)}; ${relay.fault.count} recorded faults). Check the private Apps Script status.`;
       }
+      if (deps.mode !== 'cloud') {
+        const model = deps.ollama ?? localModel();
+        health += `\nLocal AI: ${escapeHtml(model.model)} at ${escapeHtml(model.url)}`;
+      }
       await send(chatId, statusReply(watches, states, now()) + health);
       return;
     }
@@ -298,7 +302,7 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
       checking = true;
       try {
         await send(chatId, `${GREETING}\nChecking${filter ? ` “${escapeHtml(command.filter)}”` : ''} now…`);
-        const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match }, translate: deps.base?.translate ?? ownerTranslator(deps.store, deps.fetcher) }));
+        const totals = await enqueue(() => runOnce({ ...deps.base, owners: { [uid]: chatId }, store: deps.store, send: (c, t) => send(c, t), runner: 'local', manual: { uid, match }, translate: deps.base?.translate ?? ownerTranslator(deps.fetcher, deps.ollama ?? localModel()) }));
         const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
         const cloud = watches.filter(watch => watch.enabled && match(watch) && routeOf(states.get(watch.id), watch) === 'cloud').map(watch => watch.label);
         await send(chatId, checkReply(totals.outcomes, cloud, command.filter));
@@ -336,16 +340,16 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     thinking = true;
     try {
       await call('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => undefined);
-      const [settings, brain] = await Promise.all([deps.store.settings(uid), deps.store.brainSettings(uid)]);
+      const settings = await deps.store.settings(uid);
       const result = await answerQuestion(message.text ?? '', {
         uid, today: date, timeZone: settingsFrom(settings).timezone, store: deps.store, calendars: deps.calendars?.[uid] ?? [],
-        ollama: { url: localOllamaUrl(brain?.ollamaUrl ?? DEFAULT_OLLAMA.url), model: brain?.ollamaModel || DEFAULT_OLLAMA.model },
+        ollama: deps.ollama ?? localModel(),
         fetcher: deps.fetcher, now,
-      }).catch(() => ({ answer: "I couldn't reach the AI on your PC. Check that Ollama is running, then ask again.", proposals: [], toolCalls: 0 }));
+      });
       // Persist the operation before replying so transport failures cannot make fresh proposals.
       if (result.proposals.length) await offer(uid, chatId, result.proposals, date, false, identity, result.answer);
       else await send(chatId, `${GREETING}\n${result.answer}`);
-      log(`question answered: ${result.toolCalls} tool calls, ${result.proposals.length} proposals`);
+      log(`question ${result.status}: ${result.toolCalls} tool calls, ${result.proposals.length} proposals`);
     } catch {
       log('question failed; delivery remains retryable');
       throw new Error('Question handling failed.');
@@ -426,7 +430,7 @@ export async function listen(deps: ListenDeps) {
   const log = deps.log ?? (() => {});
   const enqueue = makeQueue();
   const handle = makeHandler({ ...deps, mode: 'local' }, enqueue);
-  const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local', translate: deps.base?.translate ?? ownerTranslator(deps.store, deps.fetcher),
+  const scheduled = () => enqueue(() => runOnce({ ...deps.base, owners: deps.owners, store: deps.store, runner: 'local', translate: deps.base?.translate ?? ownerTranslator(deps.fetcher, deps.ollama ?? localModel()),
     send: (chatId, text) => sendTelegram(deps.token, chatId, text, deps.fetcher) })).catch(() => log('scheduled run failed'));
   // Show the commands in Telegram's "/" menu.
   await telegramCall(deps.token, 'setMyCommands', { commands: COMMANDS.filter(c => PARCELS_ENABLED || !['track', 'parcels'].includes(c.command)) }, deps.fetcher).catch(() => undefined);

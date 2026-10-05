@@ -4,6 +4,8 @@
 $ErrorActionPreference = 'Stop'
 $dir = Join-Path $env:USERPROFILE '.voracity-watcher'
 $config = Get-Content (Join-Path $dir 'config.json') -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'model-settings.ps1')
+Set-WatcherModelEnvironment $config
 $logDir = Join-Path $dir 'logs'
 New-Item -ItemType Directory -Force $logDir | Out-Null
 $log = Join-Path $logDir 'watcher.log'

@@ -20,6 +20,9 @@ param(
   [switch]$UpdateToken,
   [string]$Calendars,
   [string]$Relay,
+  [string]$OllamaUrl,
+  [string]$OllamaModel,
+  [switch]$ShowModel,
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -31,6 +34,23 @@ if ($Uninstall) {
   Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
   Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
   Write-Output 'Removed the scheduled task and stored secrets.'
+  return
+}
+
+# Local model updates use the existing config; never prompt for or rewrite secrets.
+. (Join-Path $PSScriptRoot 'model-settings.ps1')
+if ($OllamaUrl -or $OllamaModel -or $ShowModel) {
+  $modelConfigPath = Join-Path $dir 'config.json'
+  if ($OllamaUrl -or $OllamaModel) {
+    Save-WatcherModel $modelConfigPath $OllamaUrl $OllamaModel
+    Write-Output 'Local model saved. Restart the listener to use it.'
+  }
+  if ($ShowModel) {
+    $modelConfig = Get-Content -LiteralPath $modelConfigPath -Raw | ConvertFrom-Json
+    Set-WatcherModelEnvironment $modelConfig
+    & $modelConfig.node (Join-Path $PSScriptRoot '..\model-status.ts')
+    if ($LASTEXITCODE -ne 0) { throw 'Model configuration check failed.' }
+  }
   return
 }
 
@@ -82,7 +102,11 @@ Save-Secret 'owners' (Secure $Owners)
 Save-Secret 'telegram-token' $(if ($TelegramToken) { Secure $TelegramToken } else { Ask-Token })
 
 $node = (Get-Command node -ErrorAction Stop).Source
-@{ repo = $repo; node = $node } | ConvertTo-Json | Set-Content -Path (Join-Path $dir 'config.json') -Encoding utf8
+$savedConfigPath = Join-Path $dir 'config.json'
+$savedConfig = if (Test-Path -LiteralPath $savedConfigPath) { Get-Content -LiteralPath $savedConfigPath -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+$savedConfig | Add-Member -NotePropertyName repo -NotePropertyValue $repo -Force
+$savedConfig | Add-Member -NotePropertyName node -NotePropertyValue $node -Force
+$savedConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $savedConfigPath -Encoding utf8
 
 $run = Join-Path $repo 'scripts\local\run.ps1'
 $listen = Join-Path $repo 'scripts\local\listen.ps1'

@@ -1,7 +1,7 @@
 // English names for Japanese listings, written by the owner's local Ollama model on the PC
-// (the same model and address as Ica's questions, from Voracity's settings/brain). Nothing
+// (the same PC-local configuration as Ica's questions). Nothing
 // goes to a cloud service; without the model, alerts keep the original names.
-import { DEFAULT_OLLAMA, localOllamaUrl } from './agent.ts';
+import { localModel, validateLocalModel, type LocalModel } from './local-model.ts';
 import { fromGlossary, glossaryHints, tidyName } from './glossary.ts';
 
 export type Translate = (uid: string, names: string[]) => Promise<Record<string, string>>;
@@ -33,6 +33,7 @@ export function readTranslations(content: string, asked: string[]) {
 }
 
 export function ollamaTranslator(ollama: { url: string; model: string }, fetcher: typeof fetch = fetch) {
+  const model = validateLocalModel(ollama);
   return async (names: string[]) => {
     const out: Record<string, string> = {};
     // Names the glossary covers are exact and instant; only the rest go to the model.
@@ -40,9 +41,9 @@ export function ollamaTranslator(ollama: { url: string; model: string }, fetcher
     for (const name of names) { const known = fromGlossary(name); if (known) out[name] = known; else rest.push(name); }
     for (let i = 0; i < rest.length; i += BATCH) {
       const batch = rest.slice(i, i + BATCH);
-      const response = await fetcher(`${ollama.url}/api/chat`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(TIMEOUT_MS),
-        body: JSON.stringify({ model: ollama.model, stream: false, think: false, format: 'json', options: { temperature: 0, num_ctx: 8192 },
+      const response = await fetcher(`${model.url}/api/chat`, {
+        method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(TIMEOUT_MS),
+        body: JSON.stringify({ model: model.model, stream: false, think: false, format: 'json', options: { temperature: 0, num_ctx: 8192 },
           messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(batch) }] }),
       });
       if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
@@ -53,12 +54,10 @@ export function ollamaTranslator(ollama: { url: string; model: string }, fetcher
   };
 }
 
-/** One translator per owner, using their Second Brain model on this PC (localhost only). */
-export function ownerTranslator(store: { brainSettings(uid: string): Promise<{ ollamaUrl?: string; ollamaModel?: string } | null> }, fetcher?: typeof fetch): Translate {
-  return async (uid, names) => {
-    const brain = await store.brainSettings(uid).catch(() => null);
-    return ollamaTranslator({ url: localOllamaUrl(brain?.ollamaUrl ?? DEFAULT_OLLAMA.url), model: brain?.ollamaModel || DEFAULT_OLLAMA.model }, fetcher)(names);
-  };
+/** Questions and translation use the same explicit configuration on this PC. */
+export function ownerTranslator(fetcher?: typeof fetch, model: LocalModel = localModel()): Translate {
+  const translate = ollamaTranslator(model, fetcher);
+  return async (_uid, names) => translate(names);
 }
 
 /** Keep the names in use now, then the most recently added, up to CACHE_SIZE. */

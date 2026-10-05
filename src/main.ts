@@ -31,7 +31,7 @@ try {
   const log = (line: string) => console.log(line);
   if (!messagesOnly) {
     // On the PC, Japanese names in alerts are translated by the local model; the cloud has none.
-    await runOnce({ owners: ownerMap, store, send, test: process.env.WATCHER_TEST === 'true', runner, log, translate: runner === 'local' ? ownerTranslator(store) : undefined });
+    await runOnce({ owners: ownerMap, store, send, test: process.env.WATCHER_TEST === 'true', runner, log, translate: runner === 'local' ? ownerTranslator() : undefined });
   }
   if (runner === 'cloud' && !messagesOnly) {
     // Parcels first, so the briefing has their latest status. A 17TRACK outage doesn't stop the run.
