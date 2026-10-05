@@ -112,7 +112,12 @@ export async function telegramCall(token: string, method: string, payload: Recor
     await new Promise(resolve => setTimeout(resolve, Math.min(30, body.parameters?.retry_after ?? 5) * 1000));
     response = await send();
   }
-  if (!response.ok) throw new Error(`Telegram returned HTTP ${response.status}`);
+  const result = await response.clone().json().catch(() => null) as { ok?: boolean; error_code?: number; description?: string } | null;
+  // Replaying an already-applied edit is success. Match this specific API
+  // error narrowly; other edit/send failures must keep the relay delivery pending.
+  if (method === 'editMessageText' && response.status === 400 && result?.error_code === 400
+    && typeof result.description === 'string' && /^Bad Request: message is not modified(?::|$)/.test(result.description)) return response;
+  if (!response.ok || result?.ok !== true) throw new Error(`Telegram request failed (HTTP ${response.status})`);
   return response;
 }
 

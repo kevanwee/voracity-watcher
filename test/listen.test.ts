@@ -49,12 +49,13 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   const fetcher = (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.startsWith('https://script.google.com/macros/s/')) {
-      // A fake relay: hands out whatever is queued, once.
+      // Simplified v2 transport; crash/lease behavior is covered by the Apps Script simulator.
       const params = new URL(url).searchParams;
       expect(params.get('key')).toBe('k'.repeat(40));
       relayCalls.push(`${params.get('action')}:${params.get('who')}`);
-      const updates = pendingUpdates; pendingUpdates = [];
-      return new Response(JSON.stringify({ updates }));
+      if (params.get('action') !== 'claim') return new Response(JSON.stringify({ protocol: 2, ok: true }));
+      const update = pendingUpdates.shift();
+      return new Response(JSON.stringify({ protocol: 2, deliveries: update ? [{ id: String(update.update_id), token: 'a'.repeat(32), until: clock + 120000, update }] : [] }));
     }
     if (url.startsWith(`https://api.telegram.org/bot${TOKEN}/sendMessage`)) {
       const body = JSON.parse(String(init?.body));
@@ -83,7 +84,8 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   }) as typeof fetch;
   const deps: ListenDeps = { token: TOKEN, owners: { [UID]: CHAT }, store, fetcher, now: () => clock, base: { fetcher, now: () => clock, sleep: async ms => { clock += ms; } } };
   const handle = makeHandler(deps, makeQueue());
-  const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
+  let updateId = 10;
+  const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: ++updateId, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
   const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
   const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
   return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, relayCalls, lastButtons, inbox: () => confirmations.state().pending, myCards, toasts, ollamaUrls, confirmations,
@@ -280,7 +282,7 @@ describe('the Telegram relay', () => {
     expect(s.sent[0]).toContain('<b>Water plants</b>');
     expect(s.sent[1]).toContain('<b>Buy stamps</b>');
     expect(s.offsets()).toEqual([]); // never getUpdates while the relay is in use
-    expect(s.relayCalls).toEqual(['take:cloud', 'take:cloud']); // a second look finds nothing more
+    expect(s.relayCalls).toEqual(['claim:cloud', 'ack:cloud', 'claim:cloud', 'ack:cloud', 'claim:cloud']); // a second look finds nothing more
   });
 
   it('on the PC, takes and handles one batch at a time', async () => {
@@ -290,7 +292,7 @@ describe('the Telegram relay', () => {
     expect(await relayRound(s.deps, 'pc', s.handle)).toBe(1);
     expect(s.sent.at(-1)).toContain('/check');
     expect(await relayRound(s.deps, 'pc', s.handle)).toBe(0);
-    expect(s.relayCalls).toEqual(['take:pc', 'take:pc']);
+    expect(s.relayCalls).toEqual(['claim:pc', 'ack:pc', 'claim:pc']);
   });
 });
 
@@ -463,5 +465,45 @@ describe('tracking parcels from Telegram', () => {
     await s.handle(s.message('/parcels'));
     expect(s.sent.at(-1)).toBe('Doot Doot.\n• <b>Textbooks</b>: Out for delivery');
     expect(parseCommand('/parcels')).toEqual({ name: 'parcels' });
+  });
+});
+
+describe('capture delivery recovery', () => {
+  it('replays the original buttons after a lost notification, even after confirmation', async () => {
+    const s = setup([]), original = s.message('note: Synthetic capture');
+    const normal = s.deps.fetcher!;
+    let failSend = true;
+    s.deps.fetcher = (async (input, init) => {
+      if (String(input).includes('/sendMessage') && failSend) { failSend = false; throw new Error('lost send'); }
+      return normal(input, init);
+    }) as typeof fetch;
+    await expect(s.handle(original)).rejects.toThrow();
+    const ids = Object.keys(s.inbox()); expect(ids).toHaveLength(1);
+    await s.handle(original);
+    const button = s.lastButtons()[0][0].callback_data;
+    await s.handle(s.tap(button));
+    expect(s.cards).toHaveLength(1);
+    await makeHandler(s.deps, makeQueue())(original); // Simulate a fresh process.
+    expect(s.lastButtons()[0][0].callback_data).toBe(button);
+    await s.handle(s.tap(button));
+    expect(s.cards).toHaveLength(1); expect(s.inbox()).toEqual({});
+  });
+  it('recovers the original model answer and proposal without invoking the model again', async () => {
+    let calls = 0;
+    const s = setup([], {}, [card({})], () => ++calls === 1
+      ? { message: { tool_calls: [{ function: { name: 'propose_complete', arguments: { id: 'c1' } } }] } }
+      : { message: { content: 'Synthetic answer' } });
+    const original = s.message('mark the brief done');
+    await s.handle(original);
+    const firstCalls = calls, firstButtons = s.lastButtons();
+    await s.handle(original);
+    expect(calls).toBe(firstCalls); expect(s.lastButtons()).toEqual(firstButtons);
+    expect(s.sent.filter(t => t.includes('Synthetic answer'))).toHaveLength(2);
+  });
+  it('retains direct-poll offsets on failure without skipping later messages', async () => {
+    const s = setup([]); s.queue([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }]);
+    const seen: number[] = [];
+    await expect(pollOnce(s.deps, 0, async u => { seen.push(u.update_id); if (u.update_id === 2) throw new Error('failed'); })).rejects.toMatchObject({ nextOffset: 2 });
+    expect(seen).toEqual([1, 2]);
   });
 });

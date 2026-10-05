@@ -348,10 +348,15 @@ seconds, add the **relay**:
 
 - **How it works:** Telegram pushes each message to your Apps Script the moment you send
   it. The script keeps it in a small queue and asks GitHub to run Ica straight away.
-- **When your PC is on,** it collects from the same queue every 3 seconds, so replies
-  stay near-instant and no GitHub run is started.
-- **Nothing is answered in the script.** It only holds messages until a runner collects
-  them, and each one is handed out once.
+- **When your PC is on,** it claims from the same queue every 15 seconds. Long
+  handling renews its lease and presence, so GitHub does not take over its work.
+- **Nothing is answered in the script.** It retains each accepted message until a
+  runner acknowledges successful handling. Crashes and lost responses can retry;
+  repeated captures reuse their original confirmation buttons.
+
+**Upgrading an existing relay:** follow [the coordinated H2 rollout](docs/relay.md).
+Both runners and the deployed web app need protocol 2; mixed versions pause replies
+while preserving queued work.
 
 1. In the same Apps Script project as `wake.gs`, add a file named `relay` and paste
    [`scripts/apps-script/relay.gs`](scripts/apps-script/relay.gs).
@@ -371,18 +376,19 @@ seconds, add the **relay**:
 **Timing:**
 - PC off: a message-only run takes about 20–30 s from your message to Ica's reply. It
   skips site checks.
-- PC on: a few seconds.
+- PC on: normally within 15 seconds plus processing time. These are estimates, not delivery guarantees.
 
-**To undo,** run **disconnectTelegram** and remove `WATCHER_RELAY` from GitHub and the
+**To undo,** first drain or reconcile accepted relay messages as described in
+[the rollback instructions](docs/relay.md). Then run **disconnectTelegram** and remove `WATCHER_RELAY` from GitHub and the
 PC (`Remove-Item $env:USERPROFILE\.voracity-watcher\relay.secret`). Ica then goes back
 to asking Telegram directly.
 
 **Things to know:**
 - **Use it fully or not at all.** While the webhook is on, Telegram refuses the old way
   of collecting messages. So `WATCHER_RELAY` must be set on both GitHub and the PC.
-- **Quotas:** each message uses a few Apps Script calls, and the PC's checks (one every
-  3 s, about 29,000 a day) stay within Apps Script's free daily limits for web apps and
-  properties.
+- **Quotas and failures:** [relay bounds and recovery](docs/relay.md) describe
+  admission limits, retries, expiry and the private `relayHealth` diagnostic. Quota
+  headroom depends on actual usage; no paid service or billing is enabled.
 - **If you edit the script,** deploy a new version of the web app so Telegram reaches
   the updated code.
 

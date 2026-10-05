@@ -1,3 +1,4 @@
+import { deliveryIdentity } from '../src/deliveries.ts';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import { initializeApp, deleteApp, type App } from 'firebase-admin/app';
 import { getFirestore, type Firestore } from 'firebase-admin/firestore';
@@ -73,4 +74,34 @@ test.skipIf(!enabled)('Firestore: revisions, groups and cancellation apply atomi
   await h.decide({ ...h.decisions[0], action: 'cancel' });
   expect((await h.decide()).status).toBe('cancelled');
   expect((await h.owner.collection('cards').get()).size).toBe(0);
+}, 30000);
+
+test.skipIf(!enabled)('Firestore: capture redelivery, confirmation and owner isolation share stable operation identity', async () => {
+  const uid = 'delivery-' + crypto.randomUUID(), store = confirmationStore(db);
+  const owner = db.collection('users').doc(uid);
+  const identity = deliveryIdentity({ update_id: 12, message: { date: now / 1000, chat: { id: 42 }, text: 'note: hello' } });
+  const makeOffer = (forUid = uid) => ({ identity, at: now, entries: proposalsFor(forUid, [note], now, false), date: '2027-01-15', together: false });
+  const [a, b] = await Promise.all([store.rememberOffer(uid, makeOffer(), now), store.rememberOffer(uid, makeOffer(), now)]);
+  expect(a).toEqual(b);
+  expect(Object.keys((await owner.collection('assistant').doc('inbox').get()).get('pending'))).toHaveLength(1);
+  const [id, p] = Object.entries(a.entries)[0], decision = parseDecision(callbackFor('save', id, p))!;
+  await store.decideProposal(uid, decision, now, false);
+  expect(await store.rememberOffer(uid, makeOffer(), now)).toEqual(a);
+  await store.decideProposal(uid, decision, now, false);
+  expect((await owner.collection('cards').get()).size).toBe(1);
+  expect((await owner.collection('assistant').doc('inbox').get()).get('pending')).toEqual({});
+  const other = uid + '-other';
+  expect(await store.offered(other, identity, now)).toBeNull();
+  await store.rememberOffer(other, makeOffer(other), now);
+  expect((await db.doc(`users/${other}/assistant/inbox`).get()).get('pending')).not.toEqual(a.entries);
+}, 30000);
+
+test.skipIf(!enabled)('Firestore: rejected offers leave no delivery checkpoint', async () => {
+  const uid = 'delivery-reject-' + crypto.randomUUID(), store = confirmationStore(db);
+  const identity = deliveryIdentity({ update_id: 99 });
+  const entries = proposalsFor(uid, [note], now, false);
+  Object.values(entries)[0].action = { ...note, title: '' };
+  await expect(store.rememberOffer(uid, { identity, at: now, entries, date: '2027-01-15', together: false }, now)).rejects.toThrow();
+  expect((await db.doc(`users/${uid}/assistant/inbox`).get()).exists).toBe(false);
+  expect((await db.doc(`users/${uid}/assistant/deliveries`).get()).exists).toBe(false);
 }, 30000);
