@@ -1,23 +1,19 @@
 // Ica answering open questions with the owner's local Ollama model. Read tools run
 // immediately; anything that would change data only becomes a proposal the owner
-// confirms with a button. Questions and data never leave the PC.
-import { addDays, formatDue, LIMITS, type Proposal } from './capture.ts';
+// confirms with a button. Inference stays on the PC; Telegram/Firestore remain external services.
+import { addDays, formatDue, LIMITS, safeUrl, type Proposal } from './capture.ts';
 import { eventsBetween, fetchCalendars, formatEvent } from './calendar.ts';
 import type { Bookmark } from './assistant.ts';
 import { matchCards, type Change, type CardDoc, type EditStore } from './edit.ts';
 import { escapeHtml } from './telegram.ts';
 import { routeOf, type Store } from './run.ts';
 
-export const LIMITS_AGENT = { rounds: 4, tools: 8, deadlineMs: 180_000, resultChars: 6000 } as const;
-export const DEFAULT_OLLAMA = { url: 'http://localhost:11434', model: 'qwen3:14b' };
-
-/** Only a model on this machine may receive the owner's data. */
-export function localOllamaUrl(value: unknown) {
-  try {
-    const url = new URL(String(value));
-    return (url.protocol === 'http:' || url.protocol === 'https:') && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ? url.origin : DEFAULT_OLLAMA.url;
-  } catch { return DEFAULT_OLLAMA.url; }
-}
+import { realDate, validateAction } from './confirmations.ts';
+import { AgentStop, LIMITS_AGENT, agentBudget, boundedText, plainObject, toolResult, type StopReason } from './agent-policy.ts';
+import { modelReply, parseToolArguments } from './agent-contracts.ts';
+import { validateLocalModel } from './local-model.ts';
+export { LIMITS_AGENT } from './agent-policy.ts';
+export { DEFAULT_OLLAMA, localOllamaUrl } from './local-model.ts';
 
 export interface AgentContext {
   uid: string;
@@ -28,6 +24,7 @@ export interface AgentContext {
   ollama: { url: string; model: string };
   fetcher?: typeof fetch;
   now?: () => number;
+  signal?: AbortSignal;
 }
 
 const DATE = { type: 'string', description: 'YYYY-MM-DD' };
@@ -54,12 +51,18 @@ export const TOOLS = [
     parameters: { type: 'object', properties: { title: { type: 'string' }, due_date: DATE }, required: ['title'] } },
   { name: 'propose_note', description: 'Ask the owner to confirm adding a new note.',
     parameters: { type: 'object', properties: { title: { type: 'string' }, body: { type: 'string' } }, required: ['title'] } },
-].map(fn => ({ type: 'function', function: fn }));
+].map(fn => ({ type: 'function', function: { ...fn, parameters: { ...fn.parameters, additionalProperties: false } } }));
 
-const validDate = (v: unknown): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(v + 'T00:00:00Z'));
+const validDate = (v: unknown): v is string => realDate(v);
 const brief = (c: CardDoc) => ({ id: c.id, kind: c.kind, title: c.title, ...(c.kind === 'reminder' ? { due: c.dueDate || 'none', done: c.done } : {}), ...(c.body ? { body: c.body.slice(0, 300) } : {}), ...(c.url ? { url: c.url } : {}) });
 
-export interface AgentResult { answer: string; proposals: (Proposal | Change)[]; toolCalls: number; /** Tool names and arguments, for tests (never logged). */ trace: string[] }
+export interface AgentResult {
+  answer: string; proposals: (Proposal | Change)[]; toolCalls: number;
+  status: 'complete' | StopReason;
+  usage: { inputBytes: number; responseBytes: number; rounds: number };
+  /** Tool names only; arguments and owner content are never diagnostic output. */
+  trace: string[];
+}
 
 export function systemPrompt(today: string, timeZone: string, upcoming: CardDoc[] = []) {
   const weekday = new Date(today + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', timeZone: 'UTC' });
@@ -97,16 +100,40 @@ export function confirmationAnswer(answer: string, proposals: number) {
 export function toTelegramHtml(text: string) {
   const clean = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   const html = escapeHtml(clean).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/^#{1,6}\s+/gm, '');
-  return html.length > 3500 ? html.slice(0, 3499) + '…' : html;
+  if (html.length <= 3500) return html;
+  let clipped = '';
+  for (const char of clean.replace(/\*\*/g, '')) {
+    const escaped = escapeHtml(char);
+    if (clipped.length + escaped.length > 3496) break;
+    clipped += escaped;
+  }
+  return clipped + '...';
 }
 
 export async function answerQuestion(question: string, ctx: AgentContext): Promise<AgentResult> {
   const now = ctx.now ?? Date.now;
   const fetcher = ctx.fetcher ?? fetch;
-  const deadline = now() + LIMITS_AGENT.deadlineMs;
+  const budget = agentBudget(now, ctx.signal);
+  const usage = { inputBytes: 0, responseBytes: 0, rounds: 0 };
+  let toolCalls = 0;
+  const trace: string[] = [];
   const proposals: (Proposal | Change)[] = [];
   let cardsCache: CardDoc[] | null = null, calendarCache: string[] | null = null;
-  const cards = async () => (cardsCache ??= await ctx.store.cards(ctx.uid));
+  const cards = async () => {
+    if (cardsCache) return cardsCache;
+    let values: CardDoc[];
+    try { values = await budget.wait(() => ctx.store.cards(ctx.uid)); }
+    catch (error) { if (error instanceof AgentStop) throw error; throw new AgentStop('lookup_failed'); }
+    if (!Array.isArray(values) || values.length > LIMITS_AGENT.storedCards) throw new AgentStop('invalid_result');
+    const eligible = values.filter(c => (c as CardDoc & { ai?: boolean })?.ai !== false);
+    if (eligible.some(c => !plainObject(c) || typeof c.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(c.id)
+      || !['note', 'link', 'reminder'].includes(c.kind) || typeof c.title !== 'string' || c.title.length > LIMITS.title
+      || typeof c.body !== 'string' || c.body.length > LIMITS.body || typeof c.url !== 'string' || c.url.length > LIMITS.url
+      || typeof c.done !== 'boolean' || !Number.isSafeInteger(c.revision) || c.revision < 0
+      || (c.dueDate !== '' && !realDate(c.dueDate)))) throw new AgentStop('invalid_result');
+    return cardsCache = eligible;
+  };
+  const propose = (value: Proposal | Change) => { budget.check(); proposals.push(validateAction(value)); };
   /** Resolve a card the model named by id or by title words, as /done does; never guess between several. */
   async function resolve(ref: unknown, kind?: CardDoc['kind'], openOnly = false): Promise<CardDoc | { error: string; options?: { id: string; title: string; due?: string }[] }> {
     const pool = (await cards()).filter(c => (!kind || c.kind === kind) && (!openOnly || !c.done));
@@ -133,103 +160,146 @@ export async function answerQuestion(question: string, ctx: AgentContext): Promi
         const ranged = validDate(args.from) || validDate(args.to);
         const inRange = (c: CardDoc) => !c.done && !!c.dueDate && (!validDate(args.from) || c.dueDate >= args.from) && (!validDate(args.to) || c.dueDate <= args.to);
         const list = all.filter(ranged ? inRange : pick[String(args.when)] ?? pick.upcoming).sort((a, b) => (a.dueDate || '9999').localeCompare(b.dueDate || '9999'));
-        return list.slice(0, 40).map(brief);
+        return list.map(brief);
       }
       case 'search_cards': {
         const terms = String(args.query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
         const hits = (await cards()).filter(c => (!args.kind || c.kind === args.kind) && terms.some(w => `${c.title} ${c.body} ${c.url}`.toLowerCase().includes(w)));
-        return hits.slice(0, 20).map(brief);
+        return hits.map(brief);
       }
       case 'calendar_events': {
         if (!ctx.calendars.length) return { error: 'No calendar is connected. The owner can add their Google Calendar secret iCal address to the watcher.' };
         if (!validDate(args.from) || !validDate(args.to)) return { error: 'Use YYYY-MM-DD dates.' };
-        calendarCache ??= (await fetchCalendars(ctx.calendars, fetcher)).texts;
+        if (!calendarCache) {
+          const fetched = await fetchCalendars(ctx.calendars, fetcher, budget.signal);
+          if (fetched.failed) return { error: 'Some calendar sources could not be read; coverage is incomplete.' };
+          calendarCache = fetched.texts;
+        }
         const to = args.to < args.from ? args.from : args.to;
         return eventsBetween(calendarCache, args.from, String(to) > addDays(args.from, 62) ? addDays(args.from, 62) : String(to), ctx.timeZone)
-          .slice(0, 50).map(e => ({ date: e.date, event: formatEvent(e) }));
+          .map(e => ({ date: e.date, event: formatEvent(e) }));
       }
-      case 'reading_list': return (await ctx.store.unreadBookmarks(ctx.uid)).slice(0, 20).map(b => ({ title: b.title, url: b.url }));
+      case 'reading_list': {
+        const bookmarks = await ctx.store.unreadBookmarks(ctx.uid);
+        if (!Array.isArray(bookmarks) || bookmarks.length > 2000 || bookmarks.some(b => !plainObject(b) || typeof b.title !== 'string'
+          || b.title.length > 200 || typeof b.url !== 'string' || b.url.length > LIMITS.url || !safeUrl(b.url))) throw new AgentStop('invalid_result');
+        return bookmarks.filter(b => (b as Bookmark & { ai?: boolean }).ai !== false).map(b => ({ title: b.title, url: b.url }));
+      }
       case 'watch_status': {
         const [watches, states] = await Promise.all([ctx.store.watches(ctx.uid), ctx.store.states(ctx.uid)]);
-        return watches.map(w => { const s = states.get(w.id); return { name: w.label, from: routeOf(s, w) === 'local' ? 'PC' : 'GitHub', status: s?.status ?? 'not checked', lastChange: s?.summary ?? null }; });
+        if (!Array.isArray(watches) || watches.length > 2000 || !(states instanceof Map)
+          || watches.some(w => !plainObject(w) || typeof w.label !== 'string' || w.label.length > 200)) throw new AgentStop('invalid_result');
+        return watches.map(w => {
+          const s = states.get(w.id);
+          if (s && (!['ok', 'error'].includes(s.status) || (s.summary !== undefined && typeof s.summary !== 'string'))) throw new AgentStop('invalid_result');
+          return { name: w.label, from: routeOf(s, w) === 'local' ? 'PC' : 'GitHub', status: s?.status ?? 'not checked', lastChange: s?.summary ?? null };
+        });
       }
       case 'propose_complete': {
         const c = await resolve(args.card ?? args.id, 'reminder', true);
         if (!isCard(c)) return c;
-        proposals.push({ kind: 'complete', cardId: c.id, title: c.title, revision: c.revision });
+        propose({ kind: 'complete', cardId: c.id, title: c.title, revision: c.revision });
         return { proposed: true };
       }
       case 'propose_move': {
         const c = await resolve(args.card ?? args.id, 'reminder');
         if (!isCard(c)) return c;
         if (!validDate(args.due_date)) return { error: 'due_date must be YYYY-MM-DD.' };
-        proposals.push({ kind: 'update', cardId: c.id, title: c.title, revision: c.revision, changes: { dueDate: args.due_date } });
+        propose({ kind: 'update', cardId: c.id, title: c.title, revision: c.revision, changes: { dueDate: args.due_date } });
         return { proposed: true };
       }
       case 'propose_rename': {
         const c = await resolve(args.card ?? args.id), title = String(args.title ?? '').trim();
         if (!isCard(c)) return c;
         if (!title || title.length > LIMITS.title) return { error: `title must be 1-${LIMITS.title} characters.` };
-        proposals.push({ kind: 'update', cardId: c.id, title: c.title, revision: c.revision, changes: { title } });
+        propose({ kind: 'update', cardId: c.id, title: c.title, revision: c.revision, changes: { title } });
         return { proposed: true };
       }
       case 'propose_delete': {
         const c = await resolve(args.card ?? args.id);
         if (!isCard(c)) return c;
-        proposals.push({ kind: 'delete', cardId: c.id, title: c.title, revision: c.revision, cardKind: c.kind });
+        propose({ kind: 'delete', cardId: c.id, title: c.title, revision: c.revision, cardKind: c.kind });
         return { proposed: true };
       }
       case 'propose_reminder': {
         const title = String(args.title ?? '').trim();
         if (!title || title.length > LIMITS.title) return { error: `title must be 1-${LIMITS.title} characters.` };
         if (args.due_date !== undefined && args.due_date !== '' && !validDate(args.due_date)) return { error: 'due_date must be YYYY-MM-DD.' };
-        proposals.push({ kind: 'reminder', title, body: '', dueDate: validDate(args.due_date) ? args.due_date : '' });
+        propose({ kind: 'reminder', title, body: '', dueDate: validDate(args.due_date) ? args.due_date : '' });
         return { proposed: true };
       }
       case 'propose_note': {
         const title = String(args.title ?? '').trim();
         if (!title || title.length > LIMITS.title) return { error: `title must be 1-${LIMITS.title} characters.` };
-        proposals.push({ kind: 'note', title, body: String(args.body ?? '').slice(0, LIMITS.body) });
+        propose({ kind: 'note', title, body: String(args.body ?? '').slice(0, LIMITS.body) });
         return { proposed: true };
       }
       default: return { error: `Unknown tool ${name}.` };
     }
   }
 
-  // The open reminders give the model their dates up front (it otherwise guesses them).
-  const open = (await cards()).filter(c => c.kind === 'reminder' && !c.done)
-    .sort((a, b) => (a.dueDate || '9999').localeCompare(b.dueDate || '9999')).slice(0, 30);
-  const messages: Record<string, unknown>[] = [{ role: 'system', content: systemPrompt(ctx.today, ctx.timeZone, open) }, { role: 'user', content: question.slice(0, 4000) }];
-  let toolCalls = 0;
-  const trace: string[] = [];
-  for (let round = 0; round < LIMITS_AGENT.rounds; round++) {
-    const remaining = deadline - now();
-    if (remaining <= 0) break;
-    const response = await fetcher(`${ctx.ollama.url}/api/chat`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(Math.min(remaining, 120_000)),
-      body: JSON.stringify({ model: ctx.ollama.model, messages, tools: TOOLS, stream: false, think: false, options: { temperature: 0.2, num_ctx: 8192 } }),
-    });
-    if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}`);
-    const reply = (await response.json() as { message?: { content?: string; tool_calls?: { function?: { name?: string; arguments?: unknown } }[] } }).message ?? {};
-    const calls = (reply.tool_calls ?? []).filter(call => call.function?.name);
-    if (!calls.length || toolCalls >= LIMITS_AGENT.tools) {
-      const answer = confirmationAnswer(toTelegramHtml(reply.content ?? ''), proposals.length) || "I couldn't work that out.";
-      return { answer, proposals, toolCalls, trace };
+  try {
+    budget.check();
+    if (typeof question !== 'string' || !question.trim() || question.length > LIMITS_AGENT.questionChars) throw new AgentStop('invalid_input');
+    let ollama: ReturnType<typeof validateLocalModel>;
+    try { ollama = validateLocalModel(ctx.ollama); } catch { throw new AgentStop('invalid_input'); }
+    if (!realDate(ctx.today)) throw new AgentStop('invalid_input');
+    const open = (await cards()).filter(c => c.kind === 'reminder' && !c.done)
+      .sort((a, b) => (a.dueDate || '9999').localeCompare(b.dueDate || '9999')).slice(0, 30);
+    const messages: Record<string, unknown>[] = [{ role: 'system', content: systemPrompt(ctx.today, ctx.timeZone, open) }, { role: 'user', content: question }];
+    for (let round = 0; round < LIMITS_AGENT.rounds; round++) {
+      budget.check();
+      const body = JSON.stringify({ model: ollama.model, messages, tools: TOOLS, stream: false, think: false,
+        options: { temperature: 0.2, num_ctx: 8192, num_predict: LIMITS_AGENT.outputTokens } });
+      const size = Buffer.byteLength(body);
+      if (size > LIMITS_AGENT.requestBytes || usage.inputBytes + size > LIMITS_AGENT.inputBytes) throw new AgentStop('input_limit');
+      usage.inputBytes += size; usage.rounds++;
+      const response = await budget.wait(() => fetcher(`${ollama.url}/api/chat`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: budget.signal, redirect: 'error', body,
+      }));
+      if (!response.ok) throw new AgentStop('model_unavailable');
+      const text = await budget.wait(() => boundedText(response, LIMITS_AGENT.responseBytes, budget.signal));
+      usage.responseBytes += Buffer.byteLength(text);
+      let raw: unknown;
+      try { raw = JSON.parse(text); } catch { throw new AgentStop('invalid_response'); }
+      const reply = modelReply(raw), calls = reply.tool_calls;
+      if (!calls.length) {
+        if (!reply.content.trim()) throw new AgentStop('invalid_response');
+        const answer = confirmationAnswer(toTelegramHtml(reply.content), proposals.length);
+        return { status: 'complete', answer, proposals, toolCalls, trace, usage };
+      }
+      if (toolCalls + calls.length > LIMITS_AGENT.tools) throw new AgentStop('tool_limit');
+      messages.push({ role: 'assistant', content: reply.content, tool_calls: calls });
+      for (const call of calls) {
+        budget.check(); toolCalls++;
+        const name = call.function.name;
+        let args: Record<string, unknown>, result: unknown;
+        try { args = parseToolArguments(name, call.function.arguments); }
+        catch (error) {
+          // Parser messages are fixed text; never echo raw arguments back into diagnostics.
+          messages.push({ role: 'tool', tool_name: name, content: JSON.stringify({ error: (error as Error).message }) });
+          trace.push('invalid_arguments'); continue;
+        }
+        trace.push(name);
+        try { result = await budget.wait(() => run(name, args)); }
+        catch (error) { if (error instanceof AgentStop) throw error; result = { error: 'That lookup failed; its result is unavailable.' }; }
+        budget.check();
+        messages.push({ role: 'tool', tool_name: name, content: toolResult(result) });
+      }
     }
-    messages.push({ role: 'assistant', content: reply.content ?? '', tool_calls: calls });
-    for (const call of calls) {
-      if (toolCalls >= LIMITS_AGENT.tools) break;
-      toolCalls++;
-      const raw = call.function!.arguments;
-      const args = (typeof raw === 'string' ? (() => { try { return JSON.parse(raw); } catch { return {}; } })() : raw ?? {}) as Record<string, unknown>;
-      trace.push(`${call.function!.name}(${JSON.stringify(args)})`);
-      let result: unknown;
-      try { result = await run(call.function!.name!, args); } catch { result = { error: 'That lookup failed.' }; }
-      const text = JSON.stringify(result);
-      messages.push({ role: 'tool', tool_name: call.function!.name, content: text.length > LIMITS_AGENT.resultChars ? text.slice(0, LIMITS_AGENT.resultChars) + '…(truncated)' : text });
-    }
-  }
-  return { answer: confirmationAnswer(proposals.length ? '' : 'That took too many steps. Try asking more specifically.', proposals.length), proposals, toolCalls, trace };
+    throw new AgentStop('round_limit');
+  } catch (error) {
+    const status = error instanceof AgentStop ? error.reason : budget.signal.aborted
+      ? (budget.signal.reason as AgentStop).reason : 'model_unavailable';
+    const answer = status === 'model_unavailable' ? "I couldn't reach the AI on your PC. Check that Ollama and the selected model are available, then ask again."
+      : status === 'lookup_failed' ? 'I could not read your workspace data. Try again shortly. No changes were proposed.'
+      : status === 'deadline' ? 'That took too long. Try a smaller question. No changes were proposed.'
+      : status === 'cancelled' ? 'That request was cancelled. No changes were proposed.'
+      : status === 'invalid_input' ? 'Please send a shorter, non-empty question.'
+      : 'I could not complete that request within its validation and size limits. Try a more specific question. No changes were proposed.';
+    // Discard partial proposals on any terminal failure; nothing was persisted or executed.
+    return { status, answer, proposals: [], toolCalls, trace, usage };
+  } finally { budget.close(); }
 }
 
 export { formatDue };

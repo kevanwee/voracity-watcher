@@ -182,8 +182,9 @@ If several cards match, Ica lists up to three to choose from.
 ## Questions
 
 Anything that isn't a command or a capture goes to the AI on your PC: your Ollama
-model from Voracity's Second Brain settings (default `qwen3:14b`), and only ever on
-`localhost`.
+model configured on this PC (default `qwen3:14b`), and only ever on loopback.
+[Configure and inspect Ica's model](docs/agent-execution.md); browser Second Brain
+settings are independent.
 
 - **What it can look up:** reminders (by day, week or date range), cards, the reading
   list, watches and the calendar.
@@ -191,10 +192,12 @@ model from Voracity's Second Brain settings (default `qwen3:14b`), and only ever
   confirm with a button.
 - **Examples:** "what's due before my exam?", "what's on tomorrow?", "move pay rent to
   Monday", "mark the brief done".
-- **Limits:** each question allows 4 model rounds, 8 tool calls and 3 minutes. Your
-  open reminders and the next 14 days' dates are given to the model up front, so it
-  never guesses dates.
-- **Nothing leaves your PC,** and questions aren't logged.
+- **Limits:** each question allows 4 model rounds, 8 tool calls and 3 minutes,
+  with validated arguments, bounded input/results and cancellation. Open reminder
+  dates are supplied as context; invalid dates and truncated tool calls are rejected.
+  [Execution contract and limits](docs/agent-execution.md).
+- **Inference stays on your PC.** Telegram transports messages and Firestore stores
+  workspace data and replay records. Private question text is not logged.
 - **When the PC is off,** Ica says so. There is no cloud AI fallback.
 
 ## Asking Ica to check
@@ -265,7 +268,7 @@ Open the page
   runner checks (such as yuyu-tei):
   - A built-in glossary covers common names exactly and instantly: the Digimon Royal
     Knights, Parallel, Special Edition and so on.
-  - Anything else goes to the Ollama model you chose for Second Brain, on localhost
+  - Anything else goes to the Ollama model configured on this PC, on loopback
     only. Each name is translated once and remembered with the watch.
   - If the model isn't running, the alert goes out with the original names.
   - The cloud runner never translates, and nothing is sent to an outside service.
@@ -456,7 +459,7 @@ these paths for each owner listed in `WATCHER_OWNERS`:
 | `users/{uid}/cards`, `bookmarks` | read; create on Save | Unfinished reminders and unread links for messages; new items only after you tap Save |
 | `users/{uid}/assistant/schedule`, `inbox` | read/write | Which mornings and reminders were sent; unconfirmed proposals. Not readable by browsers |
 | `users/{uid}/cards/{id}` | update / delete on confirm | Done, due date, title, or deletion, only if the revision is unchanged |
-| `users/{uid}/settings/brain` | read (PC only) | Which local Ollama model answers questions |
+| `users/{uid}/assistant/deliveries` | read/write | Bounded capture replay ledger; no browser access |
 | `users/{uid}/parcels/{id}` | read; create on Save | Parcels written by Voracity, or by Ica after you tap Save on a `track` proposal |
 | `users/{uid}/parcelState/{id}` | write | Tracking status from 17TRACK: status, carrier, latest and recent events, estimate |
 

@@ -23,7 +23,6 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
     createParcel: async (_u, parcel) => { parcels.push(parcel); },
     settings: async () => ({ timezone: 'Asia/Singapore' }),
     ...confirmations.store,
-    brainSettings: async () => ({ ollamaUrl: 'http://evil.example:11434', ollamaModel: 'qwen3:14b' }),
     unreadBookmarks: async () => [],
     cards: async () => myCards.map(c => ({ ...c })),
     updateCard: async (_u, id, revision, patch, now) => {
@@ -70,7 +69,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
     if (url.includes('/api/chat')) {
       ollamaUrls.push(url);
       if (!ollama) return new Response('', { status: 500 });
-      return new Response(JSON.stringify(ollama(JSON.parse(String(init?.body)))));
+      return new Response(JSON.stringify((() => { const r = ollama(JSON.parse(String(init?.body))) as any; return { done: true, done_reason: 'stop', ...r, message: { role: 'assistant', ...r.message } }; })()));
     }
     if (url.includes('/getUpdates')) {
       const offset = Number(new URL(url).searchParams.get('offset'));
@@ -152,7 +151,7 @@ describe('commands', () => {
     const s = setup([watch(), watch({ id: 'w2', label: 'News', runOn: 'auto', enabled: false })],
       { w1: { status: 'ok', checkedAt: 1_800_000_000_000 - 120_000, itemCount: 12, changedAt: 1_800_000_000_000 - 7_200_000, summary: '12 new' } });
     await s.handle(s.message('/status'));
-    expect(s.sent[0]).toBe('Doot Doot.\n• <b>EX13 singles</b>, from your PC: checked 2 min ago, 12 items; changed 2 h ago (12 new)\n• <b>News</b> (paused), from GitHub: not checked yet');
+    expect(s.sent[0]).toBe('Doot Doot.\n• <b>EX13 singles</b>, from your PC: checked 2 min ago, 12 items; changed 2 h ago (12 new)\n• <b>News</b> (paused), from GitHub: not checked yet\nLocal AI: qwen3:14b at http://localhost:11434');
   });
 
   it('answers /help and unknown messages', async () => {

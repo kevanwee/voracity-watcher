@@ -19,18 +19,15 @@ describe('translating listing names on the PC', () => {
       const names: string[] = JSON.parse(body.messages[1].content);
       return new Response(JSON.stringify({ message: { content: JSON.stringify(Object.fromEntries(names.map(n => [n, `EN ${n.length}`]))) } }));
     }) as typeof fetch;
-    const store = { brainSettings: async () => ({ ollamaUrl: 'http://127.0.0.1:11434', ollamaModel: 'qwen3:14b' }) };
+    const model = { url: 'http://127.0.0.1:11434', model: 'qwen3:14b' };
     const names = Array.from({ length: 35 }, (_, i) => `カード${i}`);
-    const out = await ownerTranslator(store, fetcher)('uid', names);
+    const out = await ownerTranslator(fetcher, model)('uid', names);
     expect(Object.keys(out)).toHaveLength(35);
     expect(calls).toHaveLength(2); // batches of 30
     expect(calls[0].url).toBe('http://127.0.0.1:11434/api/chat');
     expect(calls[0].body).toMatchObject({ model: 'qwen3:14b', stream: false, think: false, format: 'json', options: { temperature: 0 } });
     expect(calls[0].body.messages[0].content).toContain('official English card or character name');
-    // A non-local address is never used: it falls back to localhost.
-    const remote = { brainSettings: async () => ({ ollamaUrl: 'https://example.com', ollamaModel: 'm' }) };
-    await ownerTranslator(remote, fetcher)('uid', ['テスト']);
-    expect(calls.at(-1)!.url).toBe('http://localhost:11434/api/chat');
+    expect(() => ownerTranslator(fetcher, { url: 'https://example.com', model: 'm' })).toThrow('loopback');
     await expect(ollamaTranslator({ url: 'http://localhost:11434', model: 'm' }, (async () => new Response('', { status: 500 })) as typeof fetch)(['テスト'])).rejects.toThrow('HTTP 500');
   });
 

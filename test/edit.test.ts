@@ -65,7 +65,7 @@ describe('local AI safeguards', () => {
       { content: 'Which rent reminder?' },
     ];
     const seen: any[] = [];
-    const fetcher = (async (_u: string, init: any) => { seen.push(JSON.parse(init.body)); return new Response(JSON.stringify({ message: steps[seen.length - 1] })); }) as unknown as typeof fetch;
+    const fetcher = (async (_u: string, init: any) => { seen.push(JSON.parse(init.body)); return new Response(JSON.stringify({ done: true, done_reason: 'stop', message: { role: 'assistant', ...steps[seen.length - 1] } })); }) as unknown as typeof fetch;
     const result = await answerQuestion('mark pay done', { uid: 'u', today: TODAY, timeZone: 'Asia/Singapore', calendars: [], ollama: { url: 'http://localhost:11434', model: 'm' }, fetcher,
       store: { cards: async () => cards, unreadBookmarks: async () => [], watches: async () => [], states: async () => new Map() } as any });
     const ambiguous = JSON.parse(seen[1].messages.at(-1).content);

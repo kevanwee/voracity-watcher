@@ -81,10 +81,6 @@ export function firestoreStore(serviceAccountJson: string | undefined): FullStor
       const snap = await user(uid).collection('bookmarks').where('status', '==', 'unread').get();
       return snap.docs.map(doc => doc.data() as Bookmark);
     },
-    async brainSettings(uid) {
-      const snap = await user(uid).collection('settings').doc('brain').get();
-      return snap.exists ? (snap.data() as { ollamaUrl?: string; ollamaModel?: string }) : null;
-    },
     async parcels(uid) {
       const snap = await user(uid).collection('parcels').get();
       return snap.docs.map(doc => ({ ...doc.data(), id: doc.id }) as Parcel);

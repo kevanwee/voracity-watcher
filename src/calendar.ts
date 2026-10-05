@@ -2,6 +2,7 @@
 // No OAuth tokens are stored anywhere: the owner keeps the private feed URL as a runner
 // secret and can revoke it in Google Calendar (Settings → Integrate calendar → Reset).
 import ICAL from 'ical.js';
+import { boundedText } from './agent-policy.ts';
 
 export interface CalendarEvent {
   title: string;
@@ -93,19 +94,21 @@ export function eventsBetween(icsTexts: string[], fromDate: string, toDate: stri
 }
 
 /** Fetch each private feed. Failures are counted, never logged with the address. */
-export async function fetchCalendars(urls: string[], fetcher: typeof fetch = fetch) {
+export async function fetchCalendars(urls: string[], fetcher: typeof fetch = fetch, signal?: AbortSignal) {
   const texts: string[] = [];
   let failed = 0;
   for (const url of urls) {
+    signal?.throwIfAborted();
     try {
-      const response = await fetcher(url, { signal: AbortSignal.timeout(20_000), headers: { Accept: 'text/calendar,*/*;q=0.5' } });
-      if (!response.ok) { failed++; continue; }
+      const feedSignal = AbortSignal.any([AbortSignal.timeout(20_000), ...(signal ? [signal] : [])]);
+      const response = await fetcher(url, { signal: feedSignal, headers: { Accept: 'text/calendar,*/*;q=0.5' } });
+      if (!response.ok) { void response.body?.cancel().catch(() => {}); failed++; continue; }
       const length = Number(response.headers.get('content-length'));
-      if (length > MAX_BYTES) { failed++; continue; }
-      const text = await response.text();
+      if (length > MAX_BYTES) { void response.body?.cancel().catch(() => {}); failed++; continue; }
+      const text = await boundedText(response, MAX_BYTES, feedSignal);
       if (text.length > MAX_BYTES || !text.includes('BEGIN:VCALENDAR')) { failed++; continue; }
       texts.push(text);
-    } catch { failed++; }
+    } catch { signal?.throwIfAborted(); failed++; }
   }
   return { texts, failed };
 }
