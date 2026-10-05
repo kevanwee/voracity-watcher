@@ -18,7 +18,7 @@ transactions leave both the target and proposal unchanged. This follows Firestor
 
 - New proposals are version 1 envelopes, with validated action, creation time,
   sibling group and SHA-256 digest bound to owner and proposal ID.
-- Telegram callbacks carry action, proposal ID and a 128-bit prefix of that digest,
+- Telegram callbacks carry action, proposal ID and a 64-bit prefix of that digest,
   within the 64-byte callback limit. The chat must still match `WATCHER_OWNERS`.
   The digest binds displayed arguments; it is not a substitute for authentication.
 - Only `save` and `cancel` are accepted. Group membership comes from the stored
@@ -93,7 +93,8 @@ into this public repository.
 
 ## Remaining work
 
-Relay delivery still removes messages before successful handling. H2 must introduce
-durable update identity and claim/lease/ack recovery. H1 does not deduplicate separate
-capture messages or automatically resend a failed Telegram notification. It does not
+H1 alone does not protect incoming delivery. [H2](relay.md) adds claim/lease/ack
+recovery and a durable capture replay ledger. It must be deployed on both runners
+and the relay before that protection is active. Separate user messages remain
+separate requests; redelivery of the same update reuses its original proposal. It does not
 claim exactly-once behavior across Telegram, Calendar or other external services.

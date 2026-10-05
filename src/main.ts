@@ -4,7 +4,7 @@ import { SetupError, calendars, owners, relay, safeError, secret, serviceAccount
 import { firestoreStore } from './firestore.ts';
 import { drainOnce } from './listen.ts';
 import { PARCELS_ENABLED, briefingParcels, runParcels } from './parcels.ts';
-import { relayStatus } from './relay.ts';
+import { relayStatus, PC_ACTIVE_RELAY_MS } from './relay.ts';
 import { runOnce } from './run.ts';
 import { track17 } from './track17.ts';
 import { ownerTranslator } from './translate.ts';
@@ -13,7 +13,7 @@ import { sendTelegram } from './telegram.ts';
 /** Without the relay, the PC listener counts as away when it hasn't checked in for this long. */
 const PC_AWAY_MS = 10 * 60_000;
 /** With the relay, the PC collects every few seconds, so a short silence means it's away. */
-const PC_AWAY_RELAY_MS = 20_000;
+const PC_AWAY_RELAY_MS = PC_ACTIVE_RELAY_MS;
 
 // One run (GitHub Actions, or run.ps1 locally). Logs are counts only.
 // A message-only run (requested by the relay as a message arrives) skips everything but

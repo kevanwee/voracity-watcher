@@ -9,7 +9,8 @@ import { changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdi
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
 import { PARCELS_ARCHIVED_REPLY, PARCELS_ENABLED, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
 import { ownerTranslator } from './translate.ts';
-import { takeUpdates, type Relay } from './relay.ts';
+import { claimUpdate, finishClaim, relayStatus, RELAY_RENEW_MS, type Relay } from './relay.ts';
+import { deliveryIdentity, type DeliveryIdentity, type DeliveryStore, type OfferedDelivery } from './deliveries.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
 
 export const SCHEDULE_MS = 5 * 60_000;
@@ -140,7 +141,7 @@ export type { Pending } from './confirmations.ts';
 import { callbackFor, parseDecision, proposalsFor, type ConfirmationStore, type cardFor, type bookmarkFor } from './confirmations.ts';
 export type NewCard = ReturnType<typeof cardFor>;
 export type NewBookmark = ReturnType<typeof bookmarkFor>;
-export interface CaptureStore extends EditStore, ConfirmationStore {
+export interface CaptureStore extends EditStore, ConfirmationStore, DeliveryStore {
   settings(uid: string): Promise<Partial<AssistantSettings> | null>;
   /** The owner's Second Brain settings (users/{uid}/settings/brain): local model and address. */
   brainSettings(uid: string): Promise<{ ollamaUrl?: string; ollamaModel?: string } | null>;
@@ -224,9 +225,16 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     log(`confirmation: ${result.status}`);
   }
 
-  async function offer(uid: string, chatId: string, items: (Proposal | Change)[], date: string, together: boolean) {
-    const entries = proposalsFor(uid, items, now(), together);
-    await deps.store.offerProposals(uid, entries, now());
+  async function offer(uid: string, chatId: string, items: (Proposal | Change)[], date: string, together: boolean, identity: DeliveryIdentity, answer?: string) {
+    const at = now();
+    const saved = await deps.store.rememberOffer(uid, { identity, at, entries: proposalsFor(uid, items, at, together), date, together, ...(answer ? { answer } : {}) }, at);
+    await sendOffer(chatId, saved);
+  }
+
+  async function sendOffer(chatId: string, saved: OfferedDelivery) {
+    const { entries, date, together } = saved;
+    if (saved.answer) await send(chatId, `${GREETING}\n${saved.answer}`);
+    const items = Object.values(entries).map(p => p.action);
     const offered = Object.entries(entries);
     if (together && items.length > 1) {
       await send(chatId, changeQuestion(items as Change[], date), [
@@ -251,6 +259,9 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (!message) return;
     const chatId = String(message.chat.id), uid = ownerByChat.get(chatId);
     if (!uid) return; // Only owners in WATCHER_OWNERS can talk to Ica; everyone else is ignored.
+    const identity = deliveryIdentity(update);
+    const prior = await deps.store.offered(uid, identity, now());
+    if (prior) { await sendOffer(chatId, prior); return; }
     const command = parseCommand(message.text);
     if (command?.name === 'help') { await send(chatId, helpReply()); return; }
     const parcelsOn = deps.parcelsEnabled ?? PARCELS_ENABLED;
@@ -262,7 +273,13 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     }
     if (command?.name === 'status') {
       const [watches, states] = await Promise.all([deps.store.watches(uid), deps.store.states(uid)]);
-      await send(chatId, statusReply(watches, states, now()));
+      let health = '';
+      if (deps.relay) {
+        const relay = await relayStatus(deps.relay, deps.fetcher);
+        health = `\nDelivery queue: ${relay.pending} waiting; ${relay.failed ?? 0} failed in the last seven days.`;
+        if (relay.fault) health += `\nRelay needs attention (${escapeHtml(relay.fault.reason)}; ${relay.fault.count} recorded faults). Check the private Apps Script status.`;
+      }
+      await send(chatId, statusReply(watches, states, now()) + health);
       return;
     }
     if (command?.name === 'check') {
@@ -294,7 +311,7 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (editCommand) {
       const plan = planEdit(editCommand, await deps.store.cards(uid), date);
       if (plan.error) { await send(chatId, `${GREETING}\n${escapeHtml(plan.error)}`); return; }
-      await offer(uid, chatId, plan.changes, date, true);
+      await offer(uid, chatId, plan.changes, date, true, identity);
       log(`change proposed: ${editCommand.name}`);
       return;
     }
@@ -302,7 +319,7 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (captured && 'error' in captured) { await send(chatId, `${GREETING}\n${escapeHtml(captured.error)}`); return; }
     if (captured?.kind === 'parcel' && !parcelsOn) { await send(chatId, PARCELS_ARCHIVED_REPLY); return; }
     if (captured) {
-      await offer(uid, chatId, [captured], date, false);
+      await offer(uid, chatId, [captured], date, false, identity);
       log(`capture proposed: ${captured.kind}`);
       return;
     }
@@ -324,18 +341,24 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
         uid, today: date, timeZone: settingsFrom(settings).timezone, store: deps.store, calendars: deps.calendars?.[uid] ?? [],
         ollama: { url: localOllamaUrl(brain?.ollamaUrl ?? DEFAULT_OLLAMA.url), model: brain?.ollamaModel || DEFAULT_OLLAMA.model },
         fetcher: deps.fetcher, now,
-      });
-      await send(chatId, `${GREETING}\n${result.answer}`);
-      if (result.proposals.length) await offer(uid, chatId, result.proposals, date, false);
+      }).catch(() => ({ answer: "I couldn't reach the AI on your PC. Check that Ollama is running, then ask again.", proposals: [], toolCalls: 0 }));
+      // Persist the operation before replying so transport failures cannot make fresh proposals.
+      if (result.proposals.length) await offer(uid, chatId, result.proposals, date, false, identity, result.answer);
+      else await send(chatId, `${GREETING}\n${result.answer}`);
       log(`question answered: ${result.toolCalls} tool calls, ${result.proposals.length} proposals`);
     } catch {
-      await send(chatId, `${GREETING}\nI couldn't reach the AI on your PC. Check that Ollama is running, then ask again.`);
-      log('question failed');
+      log('question failed; delivery remains retryable');
+      throw new Error('Question handling failed.');
     } finally { thinking = false; }
   };
 }
 
 const UPDATES = encodeURIComponent('["message","callback_query"]');
+
+export class PollHandlingError extends Error {
+  nextOffset: number;
+  constructor(nextOffset: number) { super('Message handling failed; offset retained.'); this.nextOffset = nextOffset; }
+}
 
 /** Long-poll Telegram for one batch of updates; returns the next offset. */
 export async function pollOnce(deps: ListenDeps, offset: number, handle: (update: Update) => Promise<void>, timeoutS = 50) {
@@ -346,8 +369,8 @@ export async function pollOnce(deps: ListenDeps, offset: number, handle: (update
   const body = await response.json() as { result?: Update[] };
   let next = offset;
   for (const update of body.result ?? []) {
-    next = Math.max(next, update.update_id + 1);
-    try { await handle(update); } catch { deps.log?.('message handling failed'); }
+    try { await handle(update); next = Math.max(next, update.update_id + 1); }
+    catch { throw new PollHandlingError(next); }
   }
   return next;
 }
@@ -357,15 +380,35 @@ export async function pollOnce(deps: ListenDeps, offset: number, handle: (update
  * acknowledge it so neither runner sees it again.
  */
 /** How often the PC collects messages from the relay. */
-export const RELAY_POLL_MS = 3_000;
+export const RELAY_POLL_MS = 15_000;
 
-/** Collect and handle one batch from the relay; returns how many messages there were. */
+/** Handle a single leased delivery. A crash or any failure leaves it recoverable. */
 export async function relayRound(deps: ListenDeps, who: 'pc' | 'cloud', handle: (update: Update) => Promise<void>) {
-  const updates = await takeUpdates(deps.relay!, who, deps.fetcher);
-  for (const update of updates) {
-    try { await handle(update); } catch { deps.log?.('message handling failed'); }
-  }
-  return updates.length;
+  const delivery = await claimUpdate(deps.relay!, who, deps.fetcher);
+  if (!delivery) return 0;
+  let renewal: Promise<void> = Promise.resolve(), lost = false, renewing = false;
+  const timer = setInterval(() => {
+    if (renewing || lost) return;
+    renewing = true;
+    renewal = finishClaim(deps.relay!, who, delivery, 'renew', deps.fetcher)
+      .catch(() => { lost = true; deps.log?.('delivery lease renewal failed'); })
+      .finally(() => { renewing = false; });
+  }, RELAY_RENEW_MS);
+  try {
+    if (delivery.failure) {
+      const chats = delivery.chat ? Object.values(deps.owners).filter(c => c === delivery.chat) : [...new Set(Object.values(deps.owners))];
+      const reasons: Record<string, string> = { expired: 'it waited more than 24 hours', attempts_exhausted: 'it failed repeatedly', malformed: 'the stored message could not be read', capacity: 'the queue was full', oversized: 'the message was too large' };
+      for (const chat of chats) await sendTelegram(deps.token, chat,
+        `${GREETING}\nA queued request could not be fully handled because ${reasons[delivery.failure]}. Check any existing confirmation before sending it again. /status shows delivery health.`, deps.fetcher);
+    } else await handle(delivery.update!);
+    clearInterval(timer);
+    await renewal;
+    if (lost) throw new Error('Delivery lease lost.');
+    await finishClaim(deps.relay!, who, delivery, 'ack', deps.fetcher);
+  } catch {
+    deps.log?.('delivery incomplete; retained for retry');
+  } finally { clearInterval(timer); await renewal; }
+  return 1;
 }
 
 export async function drainOnce(deps: ListenDeps) {
@@ -400,6 +443,10 @@ export async function listen(deps: ListenDeps) {
   }
   for (;;) {
     try { offset = await pollOnce(deps, offset, handle); delay = 5_000; }
-    catch { log('poll failed; retrying'); await new Promise(resolve => setTimeout(resolve, delay)); delay = Math.min(delay * 2, 300_000); }
+    catch (error) {
+      if (error instanceof PollHandlingError) offset = error.nextOffset;
+      log('poll failed; retrying');
+      await new Promise(resolve => setTimeout(resolve, delay)); delay = Math.min(delay * 2, 300_000);
+    }
   }
 }

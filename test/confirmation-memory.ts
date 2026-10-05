@@ -1,4 +1,5 @@
-import { decideTransaction, offerTransaction, type ConfirmationStore, type ConfirmationTransaction, type Inbox } from '../src/confirmations.ts';
+import { findOffer, rememberOfferTransaction, type DeliveryLedger, type DeliveryStore, type DeliveryTransaction } from '../src/deliveries.ts';
+import { decideTransaction, offerTransaction, type ConfirmationStore, type Inbox } from '../src/confirmations.ts';
 import type { CardDoc } from '../src/edit.ts';
 import type { NewBookmark, NewCard } from '../src/listen.ts';
 import type { Parcel } from '../src/parcels.ts';
@@ -7,11 +8,14 @@ import type { Parcel } from '../src/parcels.ts';
 export function memoryConfirmations(cards: NewCard[], bookmarks: NewBookmark[], parcels: Parcel[], existing: CardDoc[]) {
   let inbox: Inbox = { pending: {}, receipts: {} };
   let fail = false;
+  let deliveries: DeliveryLedger = {};
   let tail: Promise<unknown> = Promise.resolve();
-  const atomic = <T>(fn: (tx: ConfirmationTransaction) => Promise<T>): Promise<T> => {
+  const atomic = <T>(fn: (tx: DeliveryTransaction) => Promise<T>): Promise<T> => {
     const run = tail.then(async () => {
       const writes: (() => void)[] = [];
       const result = await fn({
+        deliveries: async () => structuredClone(deliveries),
+        saveDeliveries: value => { writes.push(() => { deliveries = structuredClone(value); }); },
         inbox: async () => structuredClone(inbox),
         card: async id => structuredClone(existing.find(c => c.id === id)),
         parcels: async () => structuredClone(parcels),
@@ -31,7 +35,9 @@ export function memoryConfirmations(cards: NewCard[], bookmarks: NewBookmark[], 
     tail = run.catch(() => {});
     return run;
   };
-  const store: ConfirmationStore = {
+  const store: ConfirmationStore & DeliveryStore = {
+    offered: async (_uid, identity, now) => findOffer(deliveries, identity, now),
+    rememberOffer: (uid, offer, now) => atomic(tx => rememberOfferTransaction(tx, uid, offer, now)),
     offerProposals: (uid, entries, now) => atomic(tx => offerTransaction(tx, uid, entries, now)),
     decideProposal: (uid, decision, now, parcelsEnabled) => atomic(tx => decideTransaction(tx, uid, decision, now, parcelsEnabled)),
   };
