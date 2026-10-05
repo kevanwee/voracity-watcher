@@ -430,6 +430,13 @@ Until it's set, each parcel says Ica isn't set up yet.
 
 ## Data
 
+Confirmed captures and edits now use a single transaction for the effect, proposal
+consumption and a bounded retry receipt. Repeating the same confirmation returns
+the saved outcome. Buttons from the older unbound format ask for a fresh request.
+See [durable confirmations](docs/confirmations.md) for storage, validation, tests,
+rollout and the relay-delivery limitation. Update both runners together; do not
+mix the legacy inbox writer with the new adapter.
+
 The runner uses the Admin SDK, which bypasses Firestore security rules, and touches only
 these paths for each owner listed in `WATCHER_OWNERS`:
 

@@ -4,10 +4,10 @@
 // (mode 'cloud'), so quick capture still works from a phone.
 import { DEFAULT_OLLAMA, answerQuestion, localOllamaUrl } from './agent.ts';
 import { localClock, settingsFrom, type AssistantSettings, type Bookmark } from './assistant.ts';
-import { LIMITS, formatDue, parseCapture, type Proposal } from './capture.ts';
-import { applyChange, changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
+import { formatDue, parseCapture, type Proposal } from './capture.ts';
+import { changeButtonLabel, changeQuestion, changeResultText, isChange, parseEdit, planEdit, type Change, type EditStore } from './edit.ts';
 import { GREETING, escapeHtml, sendTelegram, telegramCall } from './telegram.ts';
-import { PARCELS_ARCHIVED_REPLY, PARCELS_ENABLED, parcelFor, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
+import { PARCELS_ARCHIVED_REPLY, PARCELS_ENABLED, parcelsReply, type Parcel, type ParcelState } from './parcels.ts';
 import { ownerTranslator } from './translate.ts';
 import { takeUpdates, type Relay } from './relay.ts';
 import { routeOf, runOnce, type Deps, type Outcome, type Store, type Watch, type WatchState } from './run.ts';
@@ -16,7 +16,7 @@ export const SCHEDULE_MS = 5 * 60_000;
 /** Check commands sent while the PC was off are not run late; Ica says so instead. */
 export const STALE_COMMAND_S = 10 * 60;
 /** Unconfirmed proposals are forgotten after a day (Telegram also keeps updates for 24 h). */
-export const PROPOSAL_TTL_MS = 86_400_000;
+export { PROPOSAL_TTL_MS } from './confirmations.ts';
 
 export const COMMANDS = [
   { command: 'check', description: 'Check your PC watches now (add a name to check one)' },
@@ -135,28 +135,16 @@ function savedText(p: Proposal, today: string) {
   return `Saved to My Space ✓\n<b>${escapeHtml(p.title)}</b>, due ${formatDue(p.dueDate, today)}`;
 }
 
-/** Card and bookmark documents exactly as Voracity creates them (model.ts, bookmarks.ts, firestore.rules). */
-export function cardFor(p: Extract<Proposal, { kind: 'reminder' | 'note' }>, now: number) {
-  return { id: crypto.randomUUID(), kind: p.kind, title: p.title.slice(0, LIMITS.title), body: p.body.slice(0, LIMITS.body), url: '',
-    dueDate: p.kind === 'reminder' ? p.dueDate : '', done: false, pinned: false, tone: 'cream', createdAt: now, updatedAt: now, revision: 0 };
-}
-export function bookmarkFor(p: Extract<Proposal, { kind: 'bookmark' }>, now: number) {
-  return { id: crypto.randomUUID(), url: p.url, title: p.title.slice(0, LIMITS.bookmarkTitle), snippet: '', tags: [] as string[], status: 'unread', createdAt: now, updatedAt: now, revision: 0 };
-}
+export { cardFor, bookmarkFor } from './confirmations.ts';
+export type { Pending } from './confirmations.ts';
+import { callbackFor, parseDecision, proposalsFor, type ConfirmationStore, type cardFor, type bookmarkFor } from './confirmations.ts';
 export type NewCard = ReturnType<typeof cardFor>;
 export type NewBookmark = ReturnType<typeof bookmarkFor>;
-
-export type Pending = (Proposal | Change) & { createdAt: number };
-export interface CaptureStore extends EditStore {
+export interface CaptureStore extends EditStore, ConfirmationStore {
   settings(uid: string): Promise<Partial<AssistantSettings> | null>;
   /** The owner's Second Brain settings (users/{uid}/settings/brain): local model and address. */
   brainSettings(uid: string): Promise<{ ollamaUrl?: string; ollamaModel?: string } | null>;
   unreadBookmarks(uid: string): Promise<Bookmark[]>;
-  /** Runner-only: users/{uid}/assistant/inbox. */
-  inbox(uid: string): Promise<Record<string, Pending>>;
-  saveInbox(uid: string, pending: Record<string, Pending>): Promise<void>;
-  createCard(uid: string, card: NewCard): Promise<void>;
-  createBookmark(uid: string, bookmark: NewBookmark): Promise<void>;
   parcels(uid: string): Promise<Parcel[]>;
   parcelStates(uid: string): Promise<Map<string, ParcelState>>;
   createParcel(uid: string, parcel: Parcel): Promise<void>;
@@ -190,9 +178,6 @@ export function makeQueue() {
   };
 }
 
-// Short enough that a button can carry three sibling IDs within Telegram's 64-byte callback limit.
-const proposalId = () => crypto.randomUUID().replace(/-/g, '').slice(0, 10);
-
 export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQueue>) {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? (() => {});
@@ -200,8 +185,6 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
   const call = (method: string, payload: Record<string, unknown>) => telegramCall(deps.token, method, payload, deps.fetcher);
   const ownerByChat = new Map(Object.entries(deps.owners).map(([uid, chat]) => [chat, uid]));
   const today = async (uid: string) => localClock(now(), settingsFrom(await deps.store.settings(uid)).timezone).date;
-  const livePending = async (uid: string) =>
-    Object.fromEntries(Object.entries(await deps.store.inbox(uid)).filter(([, p]) => now() - p.createdAt < PROPOSAL_TTL_MS));
   let checking = false;
 
   async function confirm(update: NonNullable<Update['callback_query']>) {
@@ -209,74 +192,57 @@ export function makeHandler(deps: ListenDeps, enqueue: ReturnType<typeof makeQue
     if (!uid || !update.message) return;
     const [action, id, revision] = (update.data ?? '').split(':');
     const edit = (text: string) => call('editMessageText', { chat_id: chatId, message_id: update.message!.message_id, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
-    if (action === 'done') {
+    if (action === 'done' && /^done:[a-zA-Z0-9_-]{1,100}:\d+$/.test(update.data ?? '') && Number.isSafeInteger(Number(revision))) {
       // One-tap "✓" from the briefing or a reminder alert: an explicit action, still revision-checked.
       const card = (await deps.store.cards(uid)).find(c => c.id === id);
-      const result = !card ? 'missing' : card.done ? 'ok' : await deps.store.updateCard(uid, id, Number(revision), { done: true }, now());
+      const result = !card || card.kind !== 'reminder' ? 'missing' : card.done ? 'ok' : await deps.store.updateCard(uid, id, Number(revision), { done: true }, now());
       const title = card?.title ?? 'That reminder';
       const toast = result === 'ok' ? `✓ ${title} is done` : result === 'missing' ? `${title} no longer exists` : `${title} changed elsewhere; send /done to try again`;
       await call('answerCallbackQuery', { callback_query_id: update.id, text: toast.slice(0, 190) }).catch(() => undefined);
       log(`reminder done from button: ${result}`);
       return;
     }
+    const decision = parseDecision(update.data ?? '');
     await call('answerCallbackQuery', { callback_query_id: update.id }).catch(() => undefined);
-    const pending = await livePending(uid);
-    if (action === 'cancel') {
-      for (const one of id.split(',')) delete pending[one];
-      await deps.store.saveInbox(uid, pending);
-      await edit(`${GREETING}\nOK, I left it as it is.`);
+    if (!decision) {
+      await edit(`${GREETING}\nThat confirmation is no longer valid. Send the request again.`);
       return;
     }
-    const proposal = pending[id];
-    if (!proposal) { await edit(`${GREETING}\nThat one expired or was already handled. Send it again if you still want it.`); return; }
-    // Siblings offered in the same message (several matches) are dropped once one is chosen.
-    for (const sibling of (update.data ?? '').split(':')[2]?.split(',') ?? []) delete pending[sibling];
-    delete pending[id];
-    const { createdAt: _created, ...p } = proposal;
+    const result = await deps.store.decideProposal(uid, decision, now(), deps.parcelsEnabled ?? PARCELS_ENABLED);
     const date = await today(uid);
-    if (isChange(p)) {
-      const result = await applyChange(deps.store, uid, p, now());
-      await deps.store.saveInbox(uid, pending);
-      await edit(changeResultText(p, result, date));
-      log(`change ${p.kind}: ${result}`);
-      return;
-    }
-    if (p.kind === 'parcel') {
-      // Refuse a number that is already being tracked, as Voracity does.
-      if ((await deps.store.parcels(uid)).some(parcel => parcel.number === p.number && !parcel.archived)) {
-        await deps.store.saveInbox(uid, pending);
-        await edit(`${GREETING}\nYou're already tracking <code>${escapeHtml(p.number)}</code>. /parcels shows its status.`);
-        return;
-      }
-      await deps.store.createParcel(uid, parcelFor(p, now()));
-    }
-    else if (p.kind === 'bookmark') await deps.store.createBookmark(uid, bookmarkFor(p, now()));
-    else await deps.store.createCard(uid, cardFor(p, now()));
-    await deps.store.saveInbox(uid, pending);
-    await edit(`${GREETING}\n${savedText(p, date)}`);
-    log(`capture saved: ${p.kind}`);
+    const p = result.proposal;
+    const text = result.status === 'cancelled' ? `${GREETING}\nOK, I left it as it is.`
+      : result.status === 'expired' ? `${GREETING}\nThat one expired or was already handled. Send it again if you still want it.`
+      : result.status === 'invalid' ? `${GREETING}\nThat proposal changed or is invalid. Send the request again.`
+      : result.status === 'disabled' ? PARCELS_ARCHIVED_REPLY
+      : result.status === 'duplicate' && p?.kind === 'parcel' ? `${GREETING}\nYou're already tracking <code>${escapeHtml(p.number)}</code>. /parcels shows its status.`
+      : p && isChange(p) ? changeResultText(p, result.status === 'saved' ? 'ok' : result.status as 'missing' | 'conflict', date)
+      : p ? `${GREETING}\n${savedText(p as Proposal, date)}` : `${GREETING}\nThat request could not be completed.`;
+    // This notification is deliberately outside the transaction. If it fails,
+    // retrying the callback returns the recorded result without another effect.
+    await edit(text);
+    log(`confirmation: ${result.status}`);
   }
 
-  /** Offer proposals: several edit candidates share one message; anything else gets its own. */
   async function offer(uid: string, chatId: string, items: (Proposal | Change)[], date: string, together: boolean) {
-    const pending = await livePending(uid);
-    const ids = items.map(() => proposalId());
-    items.forEach((item, i) => { pending[ids[i]] = { ...item, createdAt: now() }; });
-    await deps.store.saveInbox(uid, pending);
+    const entries = proposalsFor(uid, items, now(), together);
+    await deps.store.offerProposals(uid, entries, now());
+    const offered = Object.entries(entries);
     if (together && items.length > 1) {
-      const others = ids.join(',');
       await send(chatId, changeQuestion(items as Change[], date), [
-        ...items.map((item, i) => [{ text: changeButtonLabel(item as Change), data: `save:${ids[i]}:${others}` }]),
-        [{ text: 'Cancel', data: `cancel:${others}` }],
+        ...offered.map(([id, p]) => [{ text: changeButtonLabel(p.action as Change), data: callbackFor('save', id, p) }]),
+        [{ text: 'Cancel', data: callbackFor('cancel', offered[0][0], offered[0][1]) }],
       ]);
       return;
     }
-    for (const [i, item] of items.entries()) {
+    for (const [id, p] of offered) {
+      const item = p.action;
       const text = isChange(item) ? changeQuestion([item], date) : proposalText(item, date);
       const yes = isChange(item) ? (item.kind === 'delete' ? 'Delete' : item.kind === 'complete' ? 'Mark done' : 'Update') : 'Save';
-      await send(chatId, text, [[{ text: yes, data: `save:${ids[i]}` }, { text: 'Cancel', data: `cancel:${ids[i]}` }]]);
+      await send(chatId, text, [[{ text: yes, data: callbackFor('save', id, p) }, { text: 'Cancel', data: callbackFor('cancel', id, p) }]]);
     }
   }
+
   let thinking = false;
 
   return async function handle(update: Update) {

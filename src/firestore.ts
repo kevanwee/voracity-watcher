@@ -3,7 +3,8 @@ import { getFirestore } from 'firebase-admin/firestore';
 import type { AssistantSettings, AssistantStore, Bookmark, Reminder, Schedule } from './assistant.ts';
 import { VERSION } from './fetch.ts';
 import type { CardDoc, WriteResult } from './edit.ts';
-import type { CaptureStore, NewBookmark, NewCard, Pending } from './listen.ts';
+import type { CaptureStore } from './listen.ts';
+import { confirmationStore } from './confirmation-store.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from './run.ts';
 import type { Parcel, ParcelState, ParcelStore } from './parcels.ts';
 
@@ -13,8 +14,8 @@ export type FullStore = Store & AssistantStore & CaptureStore & ParcelStore & { 
 /**
  * Reads users/{uid}/watches, cards, bookmarks and settings/assistant; writes the
  * runner-only documents: watchState/{id}, watchItems/{id}, watcher/status and
- * assistant/{schedule,inbox} and parcelState/{id}. Creates cards, bookmarks and parcels only
- * after the owner taps Save.
+ * assistant/{schedule,inbox} and parcelState/{id}. Confirmed effects, proposal
+ * consumption and bounded operation receipts commit in one transaction.
  */
 export function firestoreStore(serviceAccountJson: string | undefined): FullStore {
   const emulator = !!process.env.FIRESTORE_EMULATOR_HOST;
@@ -26,6 +27,7 @@ export function firestoreStore(serviceAccountJson: string | undefined): FullStor
   const user = (uid: string) => db.collection('users').doc(uid);
   const assistant = (uid: string, name: 'schedule' | 'inbox') => user(uid).collection('assistant').doc(name);
   return {
+    ...confirmationStore(db),
     async watches(uid) {
       const snap = await user(uid).collection('watches').get();
       return snap.docs.map(doc => ({ ...doc.data(), id: doc.id }) as Watch)
@@ -78,19 +80,6 @@ export function firestoreStore(serviceAccountJson: string | undefined): FullStor
     async unreadBookmarks(uid) {
       const snap = await user(uid).collection('bookmarks').where('status', '==', 'unread').get();
       return snap.docs.map(doc => doc.data() as Bookmark);
-    },
-    async inbox(uid) {
-      const snap = await assistant(uid, 'inbox').get();
-      return ((snap.data() as { pending?: Record<string, Pending> } | undefined)?.pending) ?? {};
-    },
-    async saveInbox(uid, pending) {
-      await assistant(uid, 'inbox').set({ pending });
-    },
-    async createCard(uid, card: NewCard) {
-      await user(uid).collection('cards').doc(card.id).create(card);
-    },
-    async createBookmark(uid, bookmark: NewBookmark) {
-      await user(uid).collection('bookmarks').doc(bookmark.id).create(bookmark);
     },
     async brainSettings(uid) {
       const snap = await user(uid).collection('settings').doc('brain').get();

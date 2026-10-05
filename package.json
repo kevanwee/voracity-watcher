@@ -11,6 +11,7 @@
   "scripts": {
     "watch": "node src/main.ts",
     "test": "vitest run",
+    "test:integration": "node -e \"if (!process.env.FIRESTORE_EMULATOR_HOST) { console.error('Start the Firestore emulator first.'); process.exit(1); }\" && vitest run test/confirmations.integration.test.ts",
     "typecheck": "tsc --noEmit",
     "listen": "node src/listen-main.ts"
   },

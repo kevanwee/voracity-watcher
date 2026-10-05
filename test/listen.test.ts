@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { Parcel } from '../src/parcels.ts';
-import { drainOnce, relayRound, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Pending, type Update } from '../src/listen.ts';
+import { drainOnce, relayRound, makeHandler, makeQueue, parseCommand, pollOnce, type CaptureStore, type ListenDeps, type NewBookmark, type NewCard, type Update } from '../src/listen.ts';
 import type { ItemsDoc, Store, Watch, WatchState } from '../src/run.ts';
 import type { CardDoc } from '../src/edit.ts';
+import { memoryConfirmations } from './confirmation-memory.ts';
 
 const UID = 'owner1', CHAT = '4242', TOKEN = 'T';
 const watch = (over: Partial<Watch> = {}): Watch => ({ id: 'w1', label: 'EX13 singles', url: 'https://shop.example/ex13', selector: '.item', ignore: '', interval: 5, enabled: true, createdAt: 1, runOn: 'local', ...over });
@@ -11,9 +12,9 @@ const card = (over: Partial<CardDoc>): CardDoc => ({ id: 'c1', kind: 'reminder',
 
 function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing: CardDoc[] = [], ollama?: (body: any) => unknown) {
   const states = new Map(Object.entries(seed)), items = new Map<string, ItemsDoc>();
-  let inbox: Record<string, Pending> = {};
   const cards: NewCard[] = [], bookmarks: NewBookmark[] = [], parcels: Parcel[] = [];
   const myCards = existing.map(c => ({ ...c }));
+  const confirmations = memoryConfirmations(cards, bookmarks, parcels, myCards);
   const store: Store & CaptureStore = {
     watches: async () => watches, states: async () => new Map(states), items: async () => new Map(items),
     save: async (_u, id, state, doc) => { states.set(id, state); if (doc) items.set(id, doc); },
@@ -21,8 +22,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
     parcels: async () => parcels, parcelStates: async () => new Map([['p0', { registered: true, status: 'OutForDelivery' }]]),
     createParcel: async (_u, parcel) => { parcels.push(parcel); },
     settings: async () => ({ timezone: 'Asia/Singapore' }),
-    inbox: async () => structuredClone(inbox), saveInbox: async (_u, pending) => { inbox = structuredClone(pending); },
-    createCard: async (_u, card) => { cards.push(card); }, createBookmark: async (_u, bookmark) => { bookmarks.push(bookmark); },
+    ...confirmations.store,
     brainSettings: async () => ({ ollamaUrl: 'http://evil.example:11434', ollamaModel: 'qwen3:14b' }),
     unreadBookmarks: async () => [],
     cards: async () => myCards.map(c => ({ ...c })),
@@ -86,7 +86,7 @@ function setup(watches: Watch[], seed: Record<string, WatchState> = {}, existing
   const message = (text: string, chat = Number(CHAT), age = 0): Update => ({ update_id: 1, message: { date: Math.floor(clock / 1000) - age, text, chat: { id: chat } } });
   const tap = (data: string, chat = Number(CHAT)): Update => ({ update_id: 2, callback_query: { id: 'cb', data, message: { message_id: 77, chat: { id: chat } } } });
   const lastButtons = () => buttons.at(-1) as { text: string; callback_data: string }[][];
-  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, relayCalls, lastButtons, inbox: () => inbox, myCards, toasts, ollamaUrls,
+  return { deps, handle, message, tap, sent, edits, pages, states, cards, bookmarks, parcels, relayCalls, lastButtons, inbox: () => confirmations.state().pending, myCards, toasts, ollamaUrls, confirmations,
     queue: (updates: Update[]) => { pendingUpdates = updates; }, offsets: () => offsets, advance: (ms: number) => { clock += ms; } };
 }
 
@@ -180,7 +180,7 @@ describe('quick capture', () => {
     // Tapping again does nothing more.
     await s.handle(s.tap(save.callback_data));
     expect(s.cards).toHaveLength(1);
-    expect(s.edits.at(-1)).toContain('expired or was already handled');
+    expect(s.edits.at(-1)).toContain('Saved to My Space');
   });
 
   it('cancels, saves notes and reading-list links, and ignores other chats', async () => {
@@ -217,6 +217,35 @@ describe('quick capture', () => {
     expect(s.sent.at(-1)).toContain('What should I remind you about?');
     await s.handle(s.message('what is the weather'));
     expect(s.sent.at(-1)).toContain("I couldn't reach the AI on your PC");
+  });
+
+  it('retries a failed Telegram result notification without repeating the saved effect', async () => {
+    const s = setup([]);
+    await s.handle(s.message('note: a synthetic retry'));
+    const save = s.lastButtons()[0][0].callback_data;
+    const fetcher = s.deps.fetcher!;
+    let fail = true;
+    s.deps.fetcher = (async (input: string | URL, init?: RequestInit) => {
+      if (String(input).includes('/editMessageText') && fail) { fail = false; throw new Error('Synthetic network loss'); }
+      return fetcher(input, init);
+    }) as typeof fetch;
+    await expect(s.handle(s.tap(save))).rejects.toThrow();
+    expect(s.cards).toHaveLength(1);
+    await s.handle(s.tap(save));
+    expect(s.cards).toHaveLength(1);
+    expect(s.edits.at(-1)).toContain('Saved to My Space');
+  });
+
+  it('rejects unknown callback actions and legacy unbound buttons without a write', async () => {
+    const s = setup([]);
+    await s.handle(s.message('note: a synthetic confirmation'));
+    const save = s.lastButtons()[0][0].callback_data;
+    await s.handle(s.tap(save.replace('save:', 'anything:')));
+    await s.handle(s.tap(save.split(':').slice(0, 2).join(':')));
+    expect(s.cards).toHaveLength(0);
+    expect(s.edits.at(-1)).toContain('no longer valid');
+    await s.handle(s.tap(save));
+    expect(s.cards).toHaveLength(1);
   });
 
   it('in the cloud, answers messages, reports /check from this run, and acknowledges what it handled', async () => {
