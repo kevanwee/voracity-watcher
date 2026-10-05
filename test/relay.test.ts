@@ -74,9 +74,12 @@ describe('Apps Script durable relay', () => {
     expect(gas.store.has('U_1')).toBe(false);
   });
   it('fits Unicode payloads into properties and explicitly rejects oversized input', () => {
-    const gas = configured(); gas.post(message(1, '??'.repeat(4096)));
+    const gas = configured();
+    const unicode = '\u{1f600}'.repeat(4096);
+    expect(Buffer.byteLength(unicode)).toBe(16384);
+    gas.post(message(1, unicode));
     for (const value of gas.store.values()) expect(Buffer.byteLength(value)).toBeLessThan(9000);
-    expect(claim(gas).update.message.text).toBe('??'.repeat(4096));
+    expect(claim(gas).update.message.text).toBe(unicode);
     gas.post(message(2, 'x'.repeat(25000)));
     expect(claim(gas).failure).toBe('oversized');
   });
