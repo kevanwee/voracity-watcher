@@ -30,4 +30,3 @@ export function appsScript(props: Record<string, string> = {}) {
   const get = (params: Record<string, string>) => JSON.parse(context.doGet({ parameter: { key: store.get('RELAY_KEY'), ...params } }).text);
   return { context, store, fetched, logs, post, get, clock: () => clock, dispatchStatus: (status: number) => { dispatchStatus = status; }, advance: (ms: number) => { clock += ms; } };
 }
-
