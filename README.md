@@ -1,5 +1,10 @@
 # voracity-watcher
 
+Optional [email watcher](docs/email-watcher.md): a separate private Apps Script
+checks Gmail and consented Outlook mailboxes and sends matching new mail through
+Ica. Installation and mailbox consent are separate from merging this repository;
+no mailbox credentials or content pass through this public repository or Actions.
+
 The scheduled runner behind [Voracity](https://voracity.web.app)'s **Site watcher**
 and **Ica**, its Telegram assistant: page-change alerts, a morning briefing,
 reminder alerts, and quick capture of reminders, notes and links by message.
