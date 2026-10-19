@@ -83,15 +83,27 @@ function mailGmail(path) {
 function mailTelegram(text) {
   const props = mailProps(), token = props.getProperty('TELEGRAM_BOT_TOKEN'), chat = props.getProperty('MAIL_CHAT_ID');
   if (!token || !/^[1-9]\d*$/.test(chat || '')) throw new Error('private_bot_and_chat_required');
-  const result = mailFetch('https://api.telegram.org/bot' + token + '/sendMessage', {
-    method: 'post', contentType: 'application/json',
-    payload: JSON.stringify({ chat_id: chat, text: text.slice(0, 3800), link_preview_options: { is_disabled: true } }),
-  }, 'telegram');
+  const until = Number(props.getProperty('MAIL_TELEGRAM_RETRY_AT')) || 0;
+  if (until > Date.now()) {
+    const error = new Error('telegram_backoff'); error.retryAt = until; throw error;
+  }
+  let result;
+  try {
+    result = mailFetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ chat_id: chat, text: text.slice(0, 3800), link_preview_options: { is_disabled: true } }),
+    }, 'telegram');
+  } catch (error) {
+    if (error.retryAt > Date.now()) props.setProperty('MAIL_TELEGRAM_RETRY_AT', String(error.retryAt));
+    throw error;
+  }
   if (!result.ok) {
     const error = new Error('telegram_refused');
     error.retryAt = Date.now() + Math.max(60, Number(result.parameters?.retry_after) || 0) * 1000;
+    props.setProperty('MAIL_TELEGRAM_RETRY_AT', String(error.retryAt));
     throw error;
   }
+  props.deleteProperty('MAIL_TELEGRAM_RETRY_AT');
 }
 function mailStateKey(source) { return 'MAIL_STATE_' + source; }
 function mailReceiptKey(source, id) { return 'MAIL_SENT_' + source + '_' + mailHash(id); }

@@ -167,6 +167,20 @@ describe('Gmail lifecycle and delivery recovery', () => {
     s.context.checkMail(); expect(s.json('MAIL_HEALTH_gmail').retryAt).toBe(START + 1800000);
     expect(s.sent()).toHaveLength(1);
   });
+  it('shares Telegram backoff across mailboxes and explicit test sends', () => {
+    const s = script(); s.context.installMailWatcher();
+    gmailResponses(s, [gmail('a')], () => ({ status: 429, body: { parameters: { retry_after: 1800 } } }));
+    s.context.checkMail();
+    expect(() => s.context.mailDeliver('outlook', {
+      id: 'outlook-a', at: START + 1000, subject: 'LLM', from: 'office@example.test', body: '', url: 'https://outlook.office.com/mail/',
+    }, rules, { startedAt: START })).toThrow('telegram_backoff');
+    expect(() => s.context.testMailNotification()).toThrow('telegram_backoff');
+    expect(s.sent()).toHaveLength(1);
+    expect(s.store.get('MAIL_TELEGRAM_RETRY_AT')).toBe(String(START + 1800000));
+    s.advance(1800001);
+    s.respond(() => ({ body: { ok: true } })); s.context.testMailNotification();
+    expect(s.sent()).toHaveLength(2); expect(s.store.has('MAIL_TELEGRAM_RETRY_AT')).toBe(false);
+  });
   it('resumes within a large nonmatching history record after its time budget', () => {
     const s = script(); s.context.installMailWatcher();
     const reads: string[] = [];

@@ -11,6 +11,21 @@ Code is ready for installation; merging this repository does **not** activate it
 Each provider needs its own explicit account consent. A Gmail connector in ChatGPT
 does not grant Gmail access to this script, Voracity or Ica.
 
+## How this connects to Ica and Voracity
+
+Ica is the existing Telegram bot, rather than one single running program. Voracity's
+Site watcher panel saves website rules to Firestore. The GitHub/PC watcher runner
+reads those rules, checks sites, sends alerts as Ica, and processes Ica's incoming
+commands through the existing Telegram relay/listener.
+
+This mail companion is another alert producer using **the same bot token and
+private chat ID**. Its rules, authorization and checkpoints stay in your private
+Apps Script project. No new bot, BotFather command or Telegram webhook is needed.
+These PRs add neither an Email watcher panel in Voracity nor `/email` commands;
+the existing `/check` and `/status` commands still refer to site watches. Email
+settings and health are managed in the private script editor. Keeping this script
+separate avoids giving the public-facing relay mailbox permissions or credentials.
+
 ## Match rules
 
 Default rules are OR conditions, case insensitive:
@@ -161,7 +176,8 @@ workaround is created by this code.
   downloads stop with `gmail_body_requires_download` instead of claiming a full match
   check. Attachment contents are never inspected.
 - Provider and Telegram failures back off at least five minutes and honour HTTP
-  `Retry-After`. Fault notices are content-free and sent once per current fault;
+  `Retry-After`. Telegram backoff is shared across this script's Gmail, Outlook and
+  manual test sends. Fault notices are content-free and sent once per current fault;
   Telegram failures are not immediately retried just to send a failure notice.
   `mailHealth` exposes fixed fault codes, completion timestamps and backlog state.
 - `gmail_http_404` for history means the saved cursor may have expired. It is
